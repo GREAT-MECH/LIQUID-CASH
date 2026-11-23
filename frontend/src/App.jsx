@@ -38,15 +38,14 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
+      const encodedPair = encodeURIComponent(selectedPair);
       let chartRes = await fetch(
         `${apiBase}/api/chart/${selectedPair}?interval=${timeframe}`
       );
 
-      // Fallback if edge proxy normalizes slashes in path parameters
       if (chartRes.status === 404) {
-        const compactPair = selectedPair.replace('/', '');
         chartRes = await fetch(
-          `${apiBase}/api/chart/${compactPair}?interval=${timeframe}`
+          `${apiBase}/api/chart/${encodedPair}?interval=${timeframe}`
         );
       }
 
