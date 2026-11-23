@@ -38,10 +38,19 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const [chartRes, signalsRes] = await Promise.all([
-        fetch(`${apiBase}/api/chart/${selectedPair}?interval=${timeframe}`),
-        fetch(`${apiBase}/api/signals`),
-      ]);
+      let chartRes = await fetch(
+        `${apiBase}/api/chart/${selectedPair}?interval=${timeframe}`
+      );
+
+      // Fallback if edge proxy normalizes slashes in path parameters
+      if (chartRes.status === 404) {
+        const compactPair = selectedPair.replace('/', '');
+        chartRes = await fetch(
+          `${apiBase}/api/chart/${compactPair}?interval=${timeframe}`
+        );
+      }
+
+      const signalsRes = await fetch(`${apiBase}/api/signals`).catch(() => null);
 
       if (!chartRes.ok) {
         const errBody = await chartRes.json().catch(() => ({}));
@@ -51,7 +60,7 @@ export default function App() {
       const chartJson = await chartRes.json();
       setChartData(chartJson);
 
-      if (signalsRes.ok) {
+      if (signalsRes && signalsRes.ok) {
         const signalsJson = await signalsRes.json();
         setSignals(Array.isArray(signalsJson) ? signalsJson : []);
       }
@@ -110,7 +119,10 @@ export default function App() {
 
     const formattedCandles = chartData.candles
       .map((c) => ({
-        time: Number(c.time),
+        time:
+          typeof c.time === 'number'
+            ? c.time
+            : Math.floor(new Date(c.time).getTime() / 1000),
         open: Number(c.open),
         high: Number(c.high),
         low: Number(c.low),
@@ -339,13 +351,14 @@ export default function App() {
               </div>
             </div>
 
-            {loading && !chartData ? (
-              <div className="h-[440px] flex items-center justify-center text-sm text-slate-400">
-                Loading market candles &amp; liquidity pools...
-              </div>
-            ) : (
+            <div className="relative w-full h-[440px]">
+              {loading && !chartData && (
+                <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-400 z-10">
+                  Loading market candles &amp; liquidity pools...
+                </div>
+              )}
               <div ref={chartContainerRef} className="w-full h-[440px]" />
-            )}
+            </div>
           </div>
 
           <div className="bg-[#0b101b] rounded-xl border border-slate-800/80 p-4 flex flex-col">
