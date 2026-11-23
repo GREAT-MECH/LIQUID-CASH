@@ -1,6 +1,7 @@
 import os
+import re
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,13 +32,33 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as exc:
+        print(f"Supabase init warning: {exc}")
 
-PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "GBP/JPY", "XAU/USD"]
+PAIRS: List[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "GBP/JPY", "XAU/USD"]
+VALID_INTERVALS = {"1min", "5min", "15min", "30min", "45min", "1h", "2h", "4h", "1day"}
+
+
+def normalize_pair(raw_pair: str) -> str:
+    """Normalize pair inputs like EUR/USD, EUR-USD, or EURUSD into BASE/QUOTE."""
+    cleaned = str(raw_pair or "").split("?")[0].split("[")[0].split("(")[0].strip().upper()
+    cleaned = cleaned.replace("-", "/")
+    if "/" not in cleaned and len(cleaned) == 6:
+        cleaned = f"{cleaned[:3]}/{cleaned[3:]}"
+    return cleaned
+
+
+def normalize_interval(raw_interval: str) -> str:
+    """Sanitize interval parameter so stray characters never break TwelveData requests."""
+    cleaned = str(raw_interval or "1h").split("?")[0].split("[")[0].split("(")[0].strip().lower()
+    cleaned = re.sub(r"[^a-z0-9]", "", cleaned)
+    return cleaned if cleaned in VALID_INTERVALS else "1h"
 
 
 def parse_candle_timestamp(raw_dt: Any) -> int:
-    """Parse TwelveData datetime string into Unix epoch seconds."""
+    """Convert TwelveData datetime string into Unix epoch seconds."""
     text = str(raw_dt).strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -69,18 +90,24 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250) -> pd.
     if not TWELVE_DATA_KEY:
         raise ValueError("Missing TWELVE_DATA_KEY environment variable.")
 
-    normalized_pair = pair.replace("-", "/").strip().upper()
-    url = (
-        "https://api.twelvedata.com/time_series"
-        f"?symbol={normalized_pair}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_KEY}"
-    )
-    response = requests.get(url, timeout=15)
+    symbol = normalize_pair(pair)
+    tf = normalize_interval(interval)
+    size = max(50, min(int(outputsize), 500))
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": tf,
+        "outputsize": size,
+        "apikey": TWELVE_DATA_KEY,
+    }
+    response = requests.get(url, params=params, timeout=15)
     response.raise_for_status()
     payload = response.json()
 
     if "values" not in payload or not payload["values"]:
         detail = payload.get("message", "No candle values returned from TwelveData")
-        raise ValueError(f"TwelveData error for {normalized_pair}: {detail}")
+        raise ValueError(f"TwelveData error for {symbol} ({tf}): {detail}")
 
     df = pd.DataFrame(payload["values"])
     df = df.iloc[::-1].reset_index(drop=True)
@@ -97,27 +124,30 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
     E - Entry Candle Trigger (Pin Bar or Engulfing)
     E - Exit Engine (Liquidity target + 3x ATR trailing stop)
     """
-    df = df.copy()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    symbol = normalize_pair(pair)
+    tf = normalize_interval(timeframe)
 
-    prev_close = df["close"].shift(1)
+    work_df = df.copy()
+    work_df["ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
+    work_df["ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
+    work_df["ema20"] = work_df["close"].ewm(span=20, adjust=False).mean()
+
+    prev_close = work_df["close"].shift(1)
     tr = np.maximum(
-        df["high"] - df["low"],
+        work_df["high"] - work_df["low"],
         np.maximum(
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
+            (work_df["high"] - prev_close).abs(),
+            (work_df["low"] - prev_close).abs(),
         ),
     )
-    df["atr"] = tr.rolling(14).mean()
+    work_df["atr"] = tr.rolling(14).mean()
 
-    lookback = df.iloc[-35:-3] if len(df) >= 38 else df.iloc[:-1]
+    lookback = work_df.iloc[-35:-3] if len(work_df) >= 38 else work_df.iloc[:-1]
     bsl = float(lookback["high"].max())
     ssl = float(lookback["low"].min())
 
-    curr = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else curr
+    curr = work_df.iloc[-1]
+    prev = work_df.iloc[-2] if len(work_df) >= 2 else curr
     atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else 0.0005
 
     uptrend = float(curr["close"]) > float(curr["ema200"]) and float(curr["ema50"]) > float(curr["ema200"])
@@ -160,8 +190,8 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
         tp_liquidity = round(bsl - (0.15 * atr), 5)
         trailing_exit = round(entry - (3.0 * atr), 5)
         signal = {
-            "pair": pair,
-            "timeframe": timeframe,
+            "pair": symbol,
+            "timeframe": tf,
             "direction": "BUY",
             "market_structure": "Bullish (Above 200 EMA)",
             "liquidity_zone": round(ssl, 5),
@@ -179,8 +209,8 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
         tp_liquidity = round(ssl + (0.15 * atr), 5)
         trailing_exit = round(entry + (3.0 * atr), 5)
         signal = {
-            "pair": pair,
-            "timeframe": timeframe,
+            "pair": symbol,
+            "timeframe": tf,
             "direction": "SELL",
             "market_structure": "Bearish (Below 200 EMA)",
             "liquidity_zone": round(bsl, 5),
@@ -241,43 +271,4 @@ def root():
 
 
 @app.get("/api/chart/{pair:path}")
-def get_chart_data(pair: str, interval: str = "1h"):
-    try:
-        df = fetch_candles(pair, interval, 220)
-        signal, levels = analyze_maee_liquidity(df, pair, interval)
-        candles = [
-            {
-                "time": parse_candle_timestamp(row["datetime"]),
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-            }
-            for _, row in df.tail(120).iterrows()
-        ]
-        return {
-            "pair": pair,
-            "interval": interval,
-            "candles": candles,
-            "levels": levels,
-            "live_signal": signal,
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/signals")
-def get_signals():
-    if not supabase:
-        return []
-    try:
-        res = (
-            supabase.table("signals")
-            .select("*")
-            .order("created_at", desc=True)
-            .limit(15)
-            .execute()
-        )
-        return res.data or []
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def get_chart_data(
