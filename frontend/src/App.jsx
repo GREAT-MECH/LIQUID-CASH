@@ -38,14 +38,14 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      const encodedPair = encodeURIComponent(selectedPair);
       const [chartRes, signalsRes] = await Promise.all([
-        fetch(`${apiBase}/api/chart/${encodedPair}?interval=${timeframe}`),
+        fetch(`${apiBase}/api/chart/${selectedPair}?interval=${timeframe}`),
         fetch(`${apiBase}/api/signals`),
       ]);
 
       if (!chartRes.ok) {
-        throw new Error(`Chart API error (${chartRes.status})`);
+        const errBody = await chartRes.json().catch(() => ({}));
+        throw new Error(errBody.detail || `Chart API error (${chartRes.status})`);
       }
 
       const chartJson = await chartRes.json();
@@ -87,12 +87,8 @@ export default function App() {
         vertLines: { color: '#1e293b' },
         horzLines: { color: '#1e293b' },
       },
-      crosshair: {
-        mode: 1,
-      },
-      rightPriceScale: {
-        borderColor: '#1e293b',
-      },
+      crosshair: { mode: 1 },
+      rightPriceScale: { borderColor: '#1e293b' },
       timeScale: {
         borderColor: '#1e293b',
         timeVisible: true,
@@ -114,10 +110,7 @@ export default function App() {
 
     const formattedCandles = chartData.candles
       .map((c) => ({
-        time:
-          typeof c.time === 'number'
-            ? c.time
-            : Math.floor(new Date(c.time).getTime() / 1000),
+        time: Number(c.time),
         open: Number(c.open),
         high: Number(c.high),
         low: Number(c.low),
@@ -127,8 +120,7 @@ export default function App() {
 
     candleSeries.setData(formattedCandles);
 
-    // Draw Liquidity Lines (BSL / SSL) if returned by API
-    const levels = chartData.liquidity || chartData.levels || {};
+    const levels = chartData.levels || {};
     if (levels.bsl) {
       candleSeries.createPriceLine({
         price: Number(levels.bsl),
@@ -148,23 +140,6 @@ export default function App() {
         axisLabelVisible: true,
         title: 'SSL (Sell-Side Liquidity)',
       });
-    }
-
-    // Plot Entry / Exit / Sweep markers if available
-    if (Array.isArray(chartData.markers) && chartData.markers.length > 0) {
-      const formattedMarkers = chartData.markers
-        .map((m) => ({
-          time:
-            typeof m.time === 'number'
-              ? m.time
-              : Math.floor(new Date(m.time).getTime() / 1000),
-          position: m.position || (m.type === 'SELL' ? 'aboveBar' : 'belowBar'),
-          color: m.color || (m.type === 'SELL' ? '#ef4444' : '#10b981'),
-          shape: m.shape || (m.type === 'SELL' ? 'arrowDown' : 'arrowUp'),
-          text: m.text || m.label || '',
-        }))
-        .sort((a, b) => a.time - b.time);
-      candleSeries.setMarkers(formattedMarkers);
     }
 
     chart.timeScale().fitContent();
@@ -187,16 +162,15 @@ export default function App() {
     };
   }, [chartData]);
 
-  const maee = chartData?.maee || {};
-  const liquidity = chartData?.liquidity || chartData?.levels || {};
-  const exitStatus = maee.exit_signal || maee.status || 'MONITORING';
+  const levels = chartData?.levels || {};
+  const liveSig = chartData?.live_signal || {};
+  const exitStatus = liveSig.signal_type || liveSig.status || 'MONITORING';
   const isExitTriggered =
     String(exitStatus).toUpperCase().includes('EXIT') ||
     String(exitStatus).toUpperCase().includes('CLOSE');
 
   return (
     <div className="min-h-screen bg-[#060911] text-slate-100 font-sans">
-      {/* Top Navbar */}
       <header className="border-b border-slate-800/80 bg-[#0b101b]/90 backdrop-blur sticky top-0 z-20">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
@@ -236,7 +210,6 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
-        {/* Pair & Timeframe Controls */}
         <div className="flex flex-wrap items-center justify-between gap-4 bg-[#0b101b] p-3.5 rounded-xl border border-slate-800/80">
           <div className="flex flex-wrap items-center gap-2">
             {PAIRS.map((pair) => (
@@ -271,7 +244,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Error Banner */}
         {error && (
           <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 flex items-center gap-3 text-red-300 text-sm">
             <AlertTriangle className="h-5 w-5 text-red-400 shrink-0" />
@@ -282,7 +254,6 @@ export default function App() {
           </div>
         )}
 
-        {/* Top Diagnostic Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="bg-[#0b101b] p-4 rounded-xl border border-slate-800/80">
             <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
@@ -290,7 +261,7 @@ export default function App() {
               <ArrowUpRight className="h-4 w-4 text-amber-400" />
             </div>
             <div className="text-xl font-bold text-amber-400 font-mono">
-              {liquidity.bsl ? Number(liquidity.bsl).toFixed(5) : 'Scanning...'}
+              {levels.bsl ? Number(levels.bsl).toFixed(5) : 'Scanning...'}
             </div>
             <p className="text-[11px] text-slate-500 mt-1">Equal highs / resting buy stops</p>
           </div>
@@ -301,7 +272,7 @@ export default function App() {
               <ArrowDownRight className="h-4 w-4 text-sky-400" />
             </div>
             <div className="text-xl font-bold text-sky-400 font-mono">
-              {liquidity.ssl ? Number(liquidity.ssl).toFixed(5) : 'Scanning...'}
+              {levels.ssl ? Number(levels.ssl).toFixed(5) : 'Scanning...'}
             </div>
             <p className="text-[11px] text-slate-500 mt-1">Equal lows / resting sell stops</p>
           </div>
@@ -312,7 +283,9 @@ export default function App() {
               <Crosshair className="h-4 w-4 text-purple-400" />
             </div>
             <div className="text-xl font-bold text-white font-mono">
-              {maee.ratio !== undefined ? `${Number(maee.ratio).toFixed(2)}x` : 'Active'}
+              {levels.maee_ratio !== undefined
+                ? `${Number(levels.maee_ratio).toFixed(2)}x`
+                : 'Active'}
             </div>
             <p className="text-[11px] text-slate-500 mt-1">
               MFE vs MAE dynamic exhaustion threshold
@@ -342,14 +315,12 @@ export default function App() {
               {exitStatus}
             </div>
             <p className="text-[11px] text-slate-400 mt-1">
-              {maee.reason || 'Monitoring momentum & sweep structure'}
+              {liveSig.notes || 'Monitoring momentum & sweep structure'}
             </p>
           </div>
         </div>
 
-        {/* Main Candlestick Chart + Signals Feed */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Chart Panel */}
           <div className="lg:col-span-2 bg-[#0b101b] rounded-xl border border-slate-800/80 p-4">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
@@ -377,7 +348,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Live Signals Feed */}
           <div className="bg-[#0b101b] rounded-xl border border-slate-800/80 p-4 flex flex-col">
             <h2 className="text-sm font-semibold text-white mb-3 flex items-center justify-between">
               <span>Recent Liquidity &amp; Exit Signals</span>
@@ -393,13 +363,9 @@ export default function App() {
                 </div>
               ) : (
                 signals.map((sig, idx) => {
-                  const isBuy =
-                    String(sig.direction || sig.signal_type || '')
-                      .toUpperCase()
-                      .includes('BUY') ||
-                    String(sig.direction || sig.signal_type || '')
-                      .toUpperCase()
-                      .includes('LONG');
+                  const isBuy = String(sig.signal_type || '')
+                    .toUpperCase()
+                    .includes('BUY');
                   return (
                     <div
                       key={sig.id || idx}
@@ -412,7 +378,7 @@ export default function App() {
                           ) : (
                             <TrendingDown className="h-3.5 w-3.5 text-red-400" />
                           )}
-                          {sig.pair || sig.symbol || selectedPair}
+                          {sig.pair || selectedPair}
                         </span>
                         <span
                           className={`text-[10px] font-bold px-2 py-0.5 rounded ${
@@ -421,7 +387,7 @@ export default function App() {
                               : 'bg-red-500/15 text-red-400'
                           }`}
                         >
-                          {sig.signal_type || sig.direction || 'SIGNAL'}
+                          {sig.signal_type || 'SIGNAL'}
                         </span>
                       </div>
 
@@ -429,13 +395,13 @@ export default function App() {
                         <div>
                           Entry:{' '}
                           <span className="text-slate-200 font-mono">
-                            {sig.entry_price || sig.price || '—'}
+                            {sig.entry_price || '—'}
                           </span>
                         </div>
                         <div>
                           Exit/TP:{' '}
                           <span className="text-slate-200 font-mono">
-                            {sig.exit_price || sig.take_profit || '—'}
+                            {sig.exit_price || '—'}
                           </span>
                         </div>
                       </div>
