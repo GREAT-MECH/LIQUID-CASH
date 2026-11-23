@@ -19,7 +19,6 @@ app = FastAPI(title="LIQUID CASH Engine")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -51,14 +50,14 @@ def normalize_pair(raw_pair: str) -> str:
 
 
 def normalize_interval(raw_interval: str) -> str:
-    """Sanitize interval parameter so stray characters never break TwelveData requests."""
+    """Sanitize interval query parameters so stray characters never break TwelveData."""
     cleaned = str(raw_interval or "1h").split("?")[0].split("[")[0].split("(")[0].strip().lower()
     cleaned = re.sub(r"[^a-z0-9]", "", cleaned)
     return cleaned if cleaned in VALID_INTERVALS else "1h"
 
 
 def parse_candle_timestamp(raw_dt: Any) -> int:
-    """Convert TwelveData datetime string into Unix epoch seconds."""
+    """Convert TwelveData datetime strings into Unix epoch seconds."""
     text = str(raw_dt).strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -94,14 +93,16 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250) -> pd.
     tf = normalize_interval(interval)
     size = max(50, min(int(outputsize), 500))
 
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": tf,
-        "outputsize": size,
-        "apikey": TWELVE_DATA_KEY,
-    }
-    response = requests.get(url, params=params, timeout=15)
+    response = requests.get(
+        "https://api.twelvedata.com/time_series",
+        params={
+            "symbol": symbol,
+            "interval": tf,
+            "outputsize": size,
+            "apikey": TWELVE_DATA_KEY,
+        },
+        timeout=15,
+    )
     response.raise_for_status()
     payload = response.json()
 
@@ -112,25 +113,19 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250) -> pd.
     df = pd.DataFrame(payload["values"])
     df = df.iloc[::-1].reset_index(drop=True)
     for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
+        df.loc[:, col] = df[col].astype(float)
 
     return df
 
 
 def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
-    """
-    M - Market Structure (200 EMA + 50 EMA trend filter)
-    A - Area of Value & Liquidity Sweep (BSL / SSL pools)
-    E - Entry Candle Trigger (Pin Bar or Engulfing)
-    E - Exit Engine (Liquidity target + 3x ATR trailing stop)
-    """
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
 
     work_df = df.copy()
-    work_df["ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
-    work_df["ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
-    work_df["ema20"] = work_df["close"].ewm(span=20, adjust=False).mean()
+    work_df.loc[:, "ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
+    work_df.loc[:, "ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
+    work_df.loc[:, "ema20"] = work_df["close"].ewm(span=20, adjust=False).mean()
 
     prev_close = work_df["close"].shift(1)
     tr = np.maximum(
@@ -140,7 +135,7 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
             (work_df["low"] - prev_close).abs(),
         ),
     )
-    work_df["atr"] = tr.rolling(14).mean()
+    work_df.loc[:, "atr"] = tr.rolling(14).mean()
 
     lookback = work_df.iloc[-35:-3] if len(work_df) >= 38 else work_df.iloc[:-1]
     bsl = float(lookback["high"].max())
@@ -271,4 +266,45 @@ def root():
 
 
 @app.get("/api/chart/{pair:path}")
-def get_chart_data(
+def get_chart_data(pair: str, interval: str = "1h"):
+    symbol = normalize_pair(pair)
+    tf = normalize_interval(interval)
+    try:
+        df = fetch_candles(symbol, tf, 220)
+        signal, levels = analyze_maee_liquidity(df, symbol, tf)
+        candles = [
+            {
+                "time": parse_candle_timestamp(row["datetime"]),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
+            for _, row in df.tail(120).iterrows()
+        ]
+        return {
+            "pair": symbol,
+            "interval": tf,
+            "candles": candles,
+            "levels": levels,
+            "live_signal": signal,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/signals")
+def get_signals():
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("signals")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(15)
+            .execute()
+        )
+        return res.data or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
