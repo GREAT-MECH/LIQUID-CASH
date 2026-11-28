@@ -42,9 +42,8 @@ if SUPABASE_URL and SUPABASE_KEY:
 PAIRS: List[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "GBP/JPY", "XAU/USD"]
 VALID_INTERVALS = {"1min", "5min", "15min", "30min", "45min", "1h", "2h", "4h", "1day"}
 
-# In-memory cache to protect Twelve Data 800/day free quota
 CANDLE_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
-CACHE_TTL_SECONDS = 600  # 10 minutes
+CACHE_TTL_SECONDS = 600
 QUOTA_EXHAUSTED_UNTIL = 0.0
 
 
@@ -186,10 +185,11 @@ def analyze_maee_liquidity(
     ignore_session: bool = False,
 ):
     """
-    MAEE & Liquidity Strategy (Strict 1:3 Risk-to-Reward Ratio):
-    - Requires institutional trend alignment (EMA 50 vs EMA 200)
-    - Requires true BSL/SSL liquidity sweep + reclaim OR clean EMA50/liquidity rejection
-    - Enforces strict 1:3 Take Profit = Entry +/- (3 * Risk) with room before opposing liquidity
+    Major Liquidity Sweep & Trend Continuation Strategy (Strict 1:3 R:R):
+    - Identifies major 60-candle BSL (high pool) and SSL (low pool)
+    - Separates Major Sweep Reversals (pierces >= 0.25 ATR past pool + reclaims inside)
+      from Trend Pullback Continuations (aligned EMA 50/200 + strong rejection at value)
+    - Uses a 0.85 ATR stop-loss cushion past the extreme to reduce wick-outs, with 1:3 TP
     """
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
@@ -211,8 +211,8 @@ def analyze_maee_liquidity(
     ).max(axis=1)
     work_df["atr"] = tr.rolling(14).mean()
 
-    # Liquidity pools across recent 40-bar institutional swing structure
-    lookback = work_df.iloc[-40:-3] if len(work_df) >= 43 else work_df.iloc[:-1]
+    # Major liquidity pools over a 60-candle institutional window
+    lookback = work_df.iloc[-63:-4] if len(work_df) >= 67 else work_df.iloc[:-2]
     bsl = float(lookback["high"].max())
     ssl = float(lookback["low"].min())
 
@@ -234,40 +234,56 @@ def analyze_maee_liquidity(
     open_price = float(curr["open"])
     high_price = float(curr["high"])
     low_price = float(curr["low"])
+    ema50_val = float(curr["ema50"])
+    ema200_val = float(curr["ema200"])
 
-    uptrend = close_price > float(curr["ema200"]) and float(curr["ema50"]) > float(curr["ema200"])
-    downtrend = close_price < float(curr["ema200"]) and float(curr["ema50"]) < float(curr["ema200"])
+    # Clear trend alignment
+    strong_uptrend = close_price > ema200_val and ema50_val > ema200_val
+    strong_downtrend = close_price < ema200_val and ema50_val < ema200_val
 
-    # Sweep + Reclaim confirmation
-    ssl_sweep_reclaim = (low_price < ssl and close_price > ssl and close_price > open_price) or (
-        float(prev["low"]) < ssl and float(prev["close"]) > ssl and close_price > open_price
+    # Major sweep requires pushing at least 0.25 ATR past the major pool and closing back inside
+    sweep_margin = 0.25 * atr
+    major_ssl_sweep_reversal = (
+        (low_price <= (ssl - sweep_margin) and close_price > ssl and close_price > open_price)
+        or (
+            float(prev["low"]) <= (ssl - sweep_margin)
+            and float(prev["close"]) > ssl
+            and close_price > open_price
+            and close_price > float(prev["close"])
+        )
     )
-    bsl_sweep_reclaim = (high_price > bsl and close_price < bsl and close_price < open_price) or (
-        float(prev["high"]) > bsl and float(prev["close"]) < bsl and close_price < open_price
+    major_bsl_sweep_reversal = (
+        (high_price >= (bsl + sweep_margin) and close_price < bsl and close_price < open_price)
+        or (
+            float(prev["high"]) >= (bsl + sweep_margin)
+            and float(prev["close"]) < bsl
+            and close_price < open_price
+            and close_price < float(prev["close"])
+        )
     )
 
     body = abs(close_price - open_price)
+    candle_range = max(high_price - low_price, 1e-9)
     lower_wick = min(open_price, close_price) - low_price
     upper_wick = high_price - max(open_price, close_price)
 
-    bull_pin = (lower_wick > body * 1.8) and (close_price > open_price)
-    bull_engulf = (
-        float(prev["close"]) < float(prev["open"])
-        and close_price > open_price
-        and close_price > float(prev["open"])
-        and open_price <= float(prev["close"])
-    )
+    # Strong rejection / continuation candle rules (avoid weak/indecision candles)
+    strong_bull_rejection = (close_price > open_price) and (body >= 0.35 * candle_range or lower_wick >= 1.8 * max(body, 1e-9))
+    strong_bear_rejection = (close_price < open_price) and (body >= 0.35 * candle_range or upper_wick >= 1.8 * max(body, 1e-9))
 
-    bear_pin = (upper_wick > body * 1.8) and (close_price < open_price)
-    bear_engulf = (
-        float(prev["close"]) > float(prev["open"])
-        and close_price < open_price
-        and close_price < float(prev["open"])
-        and open_price >= float(prev["close"])
+    # Trend continuation pullback to EMA50 without breaking major structure
+    bull_continuation = (
+        strong_uptrend
+        and strong_bull_rejection
+        and low_price > ssl
+        and abs(low_price - ema50_val) <= (0.65 * atr)
     )
-
-    near_value_bull = abs(low_price - float(curr["ema50"])) <= (atr * 0.7) or abs(low_price - ssl) <= (atr * 0.7)
-    near_value_bear = abs(high_price - float(curr["ema50"])) <= (atr * 0.7) or abs(high_price - bsl) <= (atr * 0.7)
+    bear_continuation = (
+        strong_downtrend
+        and strong_bear_rejection
+        and high_price < bsl
+        and abs(high_price - ema50_val) <= (0.65 * atr)
+    )
 
     # MAEE Excursion diagnostics
     recent_window = work_df.iloc[-12:]
@@ -284,60 +300,55 @@ def analyze_maee_liquidity(
     mae_pips = round(mae_move * pip_mult, 1)
 
     signal: Optional[Dict[str, Any]] = None
+    sl_buffer = 0.85 * atr
 
-    # BULLISH SETUP (Trend-aligned + SSL Sweep or EMA50 Rejection + Strict 1:3 Ratio)
-    if session_allowed and uptrend and (ssl_sweep_reclaim or (near_value_bull and (bull_pin or bull_engulf))):
-        pattern = (
-            "SSL Liquidity Sweep + Reclaim"
-            if ssl_sweep_reclaim
-            else ("Bullish Engulfing" if bull_engulf else "Bullish Pin Bar")
-        )
+    if session_allowed and (major_ssl_sweep_reversal or bull_continuation):
+        is_sweep = major_ssl_sweep_reversal
+        setup_label = "Major SSL Sweep Reversal" if is_sweep else "Uptrend Continuation"
         entry = close_price
-        sl_raw = min(low_price, float(prev["low"])) - (0.35 * atr)
+        extreme_low = min(low_price, float(prev["low"]), ssl if is_sweep else low_price)
+        sl_raw = extreme_low - sl_buffer
         risk = entry - sl_raw
-        # Keep risk realistic (between 0.6 ATR and 2.2 ATR) and enforce strict 1:3 TP
-        if (0.5 * atr) <= risk <= (2.5 * atr):
+
+        if (0.75 * atr) <= risk <= (2.5 * atr):
             tp_raw = entry + (3.0 * risk)
-            # Confirm room toward or through BSL liquidity
-            if tp_raw <= bsl + (1.0 * atr):
+            if tp_raw <= bsl + (1.25 * atr):
                 signal = {
                     "pair": symbol,
                     "timeframe": tf,
                     "direction": "BUY",
-                    "market_structure": f"{session_name} · Bullish (1:3)",
+                    "market_structure": f"{session_name} · {setup_label}",
                     "liquidity_zone": format_price(symbol, ssl),
                     "entry_price": format_price(symbol, entry),
                     "stop_loss": format_price(symbol, sl_raw),
                     "take_profit_liquidity": format_price(symbol, tp_raw),
                     "trailing_atr_exit": format_price(symbol, entry + risk),
-                    "candle_pattern": pattern,
+                    "candle_pattern": setup_label,
                     "status": "ACTIVE",
                 }
 
-    # BEARISH SETUP (Trend-aligned + BSL Sweep or EMA50 Rejection + Strict 1:3 Ratio)
-    elif session_allowed and downtrend and (bsl_sweep_reclaim or (near_value_bear and (bear_pin or bear_engulf))):
-        pattern = (
-            "BSL Liquidity Sweep + Reclaim"
-            if bsl_sweep_reclaim
-            else ("Bearish Engulfing" if bear_engulf else "Bearish Pin Bar")
-        )
+    elif session_allowed and (major_bsl_sweep_reversal or bear_continuation):
+        is_sweep = major_bsl_sweep_reversal
+        setup_label = "Major BSL Sweep Reversal" if is_sweep else "Downtrend Continuation"
         entry = close_price
-        sl_raw = max(high_price, float(prev["high"])) + (0.35 * atr)
+        extreme_high = max(high_price, float(prev["high"]), bsl if is_sweep else high_price)
+        sl_raw = extreme_high + sl_buffer
         risk = sl_raw - entry
-        if (0.5 * atr) <= risk <= (2.5 * atr):
+
+        if (0.75 * atr) <= risk <= (2.5 * atr):
             tp_raw = entry - (3.0 * risk)
-            if tp_raw >= ssl - (1.0 * atr):
+            if tp_raw >= ssl - (1.25 * atr):
                 signal = {
                     "pair": symbol,
                     "timeframe": tf,
                     "direction": "SELL",
-                    "market_structure": f"{session_name} · Bearish (1:3)",
+                    "market_structure": f"{session_name} · {setup_label}",
                     "liquidity_zone": format_price(symbol, bsl),
                     "entry_price": format_price(symbol, entry),
                     "stop_loss": format_price(symbol, sl_raw),
                     "take_profit_liquidity": format_price(symbol, tp_raw),
                     "trailing_atr_exit": format_price(symbol, entry - risk),
-                    "candle_pattern": pattern,
+                    "candle_pattern": setup_label,
                     "status": "ACTIVE",
                 }
 
@@ -361,13 +372,13 @@ def simulate_pair_backtest(pair: str, interval: str = "1h", bars: int = 300) -> 
     lookback_bars = max(120, min(int(bars), 500))
 
     df = fetch_candles(symbol, tf, lookback_bars)
-    if len(df) < 60:
+    if len(df) < 75:
         return {"pair": symbol, "interval": tf, "bars_tested": len(df), "trades": [], "summary": {}}
 
     trades: List[Dict[str, Any]] = []
     cooldown_until_idx = 0
 
-    for idx in range(45, len(df) - 2):
+    for idx in range(68, len(df) - 2):
         if idx < cooldown_until_idx:
             continue
 
