@@ -93,7 +93,7 @@ def parse_candle_timestamp(raw_dt: Any) -> int:
 
 
 def get_session_for_dt(dt_obj: datetime) -> Tuple[bool, str]:
-    weekday = dt_obj.weekday()  # 0=Mon ... 6=Sun
+    weekday = dt_obj.weekday()
     hour = dt_obj.hour
 
     if weekday == 5 or (weekday == 4 and hour >= 22) or (weekday == 6 and hour < 22):
@@ -109,7 +109,6 @@ def get_session_for_dt(dt_obj: datetime) -> Tuple[bool, str]:
 
 
 def get_active_session() -> Tuple[bool, str]:
-    """Check if current UTC time is inside active London or New York liquidity sessions."""
     return get_session_for_dt(datetime.now(timezone.utc))
 
 
@@ -131,7 +130,7 @@ def send_telegram(message: str) -> None:
         print(f"Telegram alert error: {exc}")
 
 
-def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250, force_refresh: bool = False) -> pd.DataFrame:
+def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 300, force_refresh: bool = False) -> pd.DataFrame:
     global QUOTA_EXHAUSTED_UNTIL
 
     if not TWELVE_DATA_KEY:
@@ -144,7 +143,7 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250, force_
 
     if not force_refresh and cache_key in CANDLE_CACHE:
         cached_at, cached_df = CANDLE_CACHE[cache_key]
-        if (now - cached_at) < CACHE_TTL_SECONDS and len(cached_df) >= min(outputsize, 220):
+        if (now - cached_at) < CACHE_TTL_SECONDS and len(cached_df) >= min(outputsize, 250):
             return cached_df.copy()
 
     if now < QUOTA_EXHAUSTED_UNTIL and cache_key in CANDLE_CACHE:
@@ -216,7 +215,6 @@ def analyze_maee_liquidity(
     prev = work_df.iloc[-2] if len(work_df) >= 2 else curr
     atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else 0.0005
 
-    # When backtesting historical bars, check the historical candle's own session window
     if ignore_session and "datetime" in curr:
         try:
             candle_ts = parse_candle_timestamp(curr["datetime"])
@@ -235,7 +233,6 @@ def analyze_maee_liquidity(
     uptrend = close_price > float(curr["ema200"]) and float(curr["ema50"]) > float(curr["ema200"])
     downtrend = close_price < float(curr["ema200"]) and float(curr["ema50"]) < float(curr["ema200"])
 
-    # True Institutional Sweep + Reclaim detection
     ssl_sweep_reclaim = (low_price < ssl and close_price > ssl) or (
         float(prev["low"]) < ssl and float(prev["close"]) > ssl and close_price > open_price
     )
@@ -272,7 +269,6 @@ def analyze_maee_liquidity(
         or abs(high_price - bsl) <= (atr * 0.8)
     )
 
-    # Live MAEE (Maximum Favorable vs Adverse Excursion) over recent 12-bar swing
     recent_window = work_df.iloc[-12:]
     swing_origin = float(recent_window.iloc[0]["open"])
     if close_price >= swing_origin:
@@ -378,6 +374,122 @@ def analyze_maee_liquidity(
     return signal, levels
 
 
+def simulate_pair_backtest(pair: str, interval: str = "1h", bars: int = 300) -> Dict[str, Any]:
+    symbol = normalize_pair(pair)
+    tf = normalize_interval(interval)
+    lookback_bars = max(120, min(int(bars), 500))
+
+    df = fetch_candles(symbol, tf, lookback_bars)
+    if len(df) < 60:
+        return {"pair": symbol, "interval": tf, "bars_tested": len(df), "trades": [], "summary": {}}
+
+    trades: List[Dict[str, Any]] = []
+    cooldown_until_idx = 0
+
+    for idx in range(45, len(df) - 2):
+        if idx < cooldown_until_idx:
+            continue
+
+        slice_df = df.iloc[: idx + 1]
+        signal, _ = analyze_maee_liquidity(slice_df, symbol, tf, ignore_session=True)
+        if not signal:
+            continue
+
+        entry = float(signal["entry_price"])
+        sl = float(signal["stop_loss"])
+        tp = float(signal["take_profit_liquidity"])
+        direction = signal["direction"]
+        entry_dt_raw = str(df.iloc[idx].get("datetime", ""))
+        entry_ts = parse_candle_timestamp(entry_dt_raw) if entry_dt_raw else 0
+
+        outcome = "OPEN"
+        exit_dt_raw = ""
+        exit_ts = 0
+        exit_price = entry
+
+        for fwd_idx in range(idx + 1, min(idx + 48, len(df))):
+            candle = df.iloc[fwd_idx]
+            hi = float(candle["high"])
+            lo = float(candle["low"])
+
+            if direction == "BUY":
+                if lo <= sl:
+                    outcome = "LOST"
+                    exit_price = sl
+                    exit_dt_raw = str(candle.get("datetime", ""))
+                    exit_ts = parse_candle_timestamp(exit_dt_raw) if exit_dt_raw else 0
+                    cooldown_until_idx = fwd_idx + 1
+                    break
+                if hi >= tp:
+                    outcome = "WON"
+                    exit_price = tp
+                    exit_dt_raw = str(candle.get("datetime", ""))
+                    exit_ts = parse_candle_timestamp(exit_dt_raw) if exit_dt_raw else 0
+                    cooldown_until_idx = fwd_idx + 1
+                    break
+            else:
+                if hi >= sl:
+                    outcome = "LOST"
+                    exit_price = sl
+                    exit_dt_raw = str(candle.get("datetime", ""))
+                    exit_ts = parse_candle_timestamp(exit_dt_raw) if exit_dt_raw else 0
+                    cooldown_until_idx = fwd_idx + 1
+                    break
+                if lo <= tp:
+                    outcome = "WON"
+                    exit_price = tp
+                    exit_dt_raw = str(candle.get("datetime", ""))
+                    exit_ts = parse_candle_timestamp(exit_dt_raw) if exit_dt_raw else 0
+                    cooldown_until_idx = fwd_idx + 1
+                    break
+
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        rr = round(reward / risk, 2) if risk > 0 else 0.0
+        net_r = rr if outcome == "WON" else (-1.0 if outcome == "LOST" else 0.0)
+
+        trades.append({
+            "id": f"bt-{symbol}-{idx}",
+            "pair": symbol,
+            "timeframe": tf,
+            "direction": direction,
+            "candle_pattern": signal["candle_pattern"],
+            "entry_price": signal["entry_price"],
+            "stop_loss": signal["stop_loss"],
+            "take_profit_liquidity": signal["take_profit_liquidity"],
+            "trailing_atr_exit": signal["trailing_atr_exit"],
+            "entry_time": entry_dt_raw,
+            "entry_ts": entry_ts,
+            "exit_time": exit_dt_raw,
+            "exit_ts": exit_ts,
+            "exit_price": exit_price,
+            "rr": rr,
+            "net_r": net_r,
+            "status": outcome,
+        })
+
+    closed = [t for t in trades if t["status"] in ("WON", "LOST")]
+    wins = [t for t in closed if t["status"] == "WON"]
+    losses = [t for t in closed if t["status"] == "LOST"]
+    win_rate = round((len(wins) / len(closed)) * 100, 1) if closed else 0.0
+    total_r = round(sum(t["net_r"] for t in closed), 2)
+
+    return {
+        "pair": symbol,
+        "interval": tf,
+        "bars_tested": len(df),
+        "summary": {
+            "total_signals": len(trades),
+            "closed_trades": len(closed),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": win_rate,
+            "net_r": total_r,
+        },
+        "trades": list(reversed(trades)),
+    }
+
+
 def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
     in_session, session_name = get_active_session()
     if not in_session and not force_refresh:
@@ -387,7 +499,7 @@ def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
     triggered: List[Dict[str, Any]] = []
     for pair in PAIRS:
         try:
-            df = fetch_candles(pair, "1h", 250, force_refresh=force_refresh)
+            df = fetch_candles(pair, "1h", 300, force_refresh=force_refresh)
             signal, _ = analyze_maee_liquidity(df, pair, "1h", ignore_session=False)
             if signal:
                 triggered.append(signal)
@@ -438,8 +550,13 @@ def get_chart_data(pair: str, interval: str = "1h"):
     symbol = normalize_pair(pair)
     tf = normalize_interval(interval)
     try:
-        df = fetch_candles(symbol, tf, 250)
+        df = fetch_candles(symbol, tf, 300)
         signal, levels = analyze_maee_liquidity(df, symbol, tf, ignore_session=False)
+
+        work_df = df.copy()
+        work_df.loc[:, "ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
+        work_df.loc[:, "ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
+
         candles = [
             {
                 "time": parse_candle_timestamp(row["datetime"]),
@@ -447,8 +564,10 @@ def get_chart_data(pair: str, interval: str = "1h"):
                 "high": float(row["high"]),
                 "low": float(row["low"]),
                 "close": float(row["close"]),
+                "ema50": round(float(row["ema50"]), 5),
+                "ema200": round(float(row["ema200"]), 5),
             }
-            for _, row in df.tail(140).iterrows()
+            for _, row in work_df.tail(260).iterrows()
         ]
         return {
             "pair": symbol,
@@ -464,115 +583,66 @@ def get_chart_data(pair: str, interval: str = "1h"):
 
 @app.get("/api/backtest/{pair:path}")
 def run_historical_backtest(pair: str, interval: str = "1h", bars: int = 300):
-    """Walk historical candles to simulate past LIQUID CASH setups and calculate Win/Loss stats."""
-    symbol = normalize_pair(pair)
-    tf = normalize_interval(interval)
-    lookback_bars = max(120, min(int(bars), 500))
-
     try:
-        df = fetch_candles(symbol, tf, lookback_bars)
-        if len(df) < 60:
-            return {"pair": symbol, "interval": tf, "trades": [], "summary": {}}
-
-        trades: List[Dict[str, Any]] = []
-        cooldown_until_idx = 0
-
-        for idx in range(45, len(df) - 2):
-            if idx < cooldown_until_idx:
-                continue
-
-            slice_df = df.iloc[: idx + 1]
-            signal, _ = analyze_maee_liquidity(slice_df, symbol, tf, ignore_session=True)
-            if not signal:
-                continue
-
-            entry = float(signal["entry_price"])
-            sl = float(signal["stop_loss"])
-            tp = float(signal["take_profit_liquidity"])
-            direction = signal["direction"]
-            entry_time = str(df.iloc[idx].get("datetime", ""))
-
-            outcome = "OPEN"
-            exit_time = ""
-            exit_price = entry
-
-            for fwd_idx in range(idx + 1, min(idx + 48, len(df))):
-                candle = df.iloc[fwd_idx]
-                hi = float(candle["high"])
-                lo = float(candle["low"])
-
-                if direction == "BUY":
-                    if lo <= sl:
-                        outcome = "LOST"
-                        exit_price = sl
-                        exit_time = str(candle.get("datetime", ""))
-                        cooldown_until_idx = fwd_idx + 1
-                        break
-                    if hi >= tp:
-                        outcome = "WON"
-                        exit_price = tp
-                        exit_time = str(candle.get("datetime", ""))
-                        cooldown_until_idx = fwd_idx + 1
-                        break
-                else:
-                    if hi >= sl:
-                        outcome = "LOST"
-                        exit_price = sl
-                        exit_time = str(candle.get("datetime", ""))
-                        cooldown_until_idx = fwd_idx + 1
-                        break
-                    if lo <= tp:
-                        outcome = "WON"
-                        exit_price = tp
-                        exit_time = str(candle.get("datetime", ""))
-                        cooldown_until_idx = fwd_idx + 1
-                        break
-
-            risk = abs(entry - sl)
-            reward = abs(tp - entry)
-            rr = round(reward / risk, 2) if risk > 0 else 0.0
-            net_r = rr if outcome == "WON" else (-1.0 if outcome == "LOST" else 0.0)
-
-            trades.append({
-                "id": f"bt-{symbol}-{idx}",
-                "pair": symbol,
-                "timeframe": tf,
-                "direction": direction,
-                "candle_pattern": signal["candle_pattern"],
-                "entry_price": signal["entry_price"],
-                "stop_loss": signal["stop_loss"],
-                "take_profit_liquidity": signal["take_profit_liquidity"],
-                "trailing_atr_exit": signal["trailing_atr_exit"],
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "exit_price": exit_price,
-                "rr": rr,
-                "net_r": net_r,
-                "status": outcome,
-            })
-
-        closed = [t for t in trades if t["status"] in ("WON", "LOST")]
-        wins = [t for t in closed if t["status"] == "WON"]
-        losses = [t for t in closed if t["status"] == "LOST"]
-        win_rate = round((len(wins) / len(closed)) * 100, 1) if closed else 0.0
-        total_r = round(sum(t["net_r"] for t in closed), 2)
-
-        return {
-            "pair": symbol,
-            "interval": tf,
-            "bars_tested": len(df),
-            "summary": {
-                "total_signals": len(trades),
-                "closed_trades": len(closed),
-                "wins": len(wins),
-                "losses": len(losses),
-                "win_rate": win_rate,
-                "net_r": total_r,
-            },
-            "trades": list(reversed(trades)),
-        }
+        return simulate_pair_backtest(pair, interval, bars)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest-all")
+def run_all_pairs_backtest(interval: str = "1h", bars: int = 300):
+    """Run historical backtest across all 5 pairs and return portfolio + per-pair breakdown."""
+    tf = normalize_interval(interval)
+    per_pair: List[Dict[str, Any]] = []
+    all_trades: List[Dict[str, Any]] = []
+
+    for pair in PAIRS:
+        try:
+            res = simulate_pair_backtest(pair, tf, bars)
+            summary = res.get("summary", {})
+            per_pair.append({
+                "pair": pair,
+                "closed_trades": summary.get("closed_trades", 0),
+                "wins": summary.get("wins", 0),
+                "losses": summary.get("losses", 0),
+                "win_rate": summary.get("win_rate", 0.0),
+                "net_r": summary.get("net_r", 0.0),
+            })
+            all_trades.extend(res.get("trades", []))
+        except Exception as exc:
+            per_pair.append({
+                "pair": pair,
+                "closed_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "net_r": 0.0,
+                "error": str(exc),
+            })
+
+    closed = [t for t in all_trades if t["status"] in ("WON", "LOST")]
+    wins = [t for t in closed if t["status"] == "WON"]
+    losses = [t for t in closed if t["status"] == "LOST"]
+    win_rate = round((len(wins) / len(closed)) * 100, 1) if closed else 0.0
+    net_r = round(sum(t["net_r"] for t in closed), 2)
+
+    all_trades.sort(key=lambda t: t.get("entry_ts", 0), reverse=True)
+    per_pair.sort(key=lambda p: p.get("net_r", 0), reverse=True)
+
+    return {
+        "interval": tf,
+        "bars_tested": bars,
+        "summary": {
+            "total_signals": len(all_trades),
+            "closed_trades": len(closed),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": win_rate,
+            "net_r": net_r,
+        },
+        "per_pair": per_pair,
+        "trades": all_trades,
+    }
 
 
 @app.get("/api/signals")
