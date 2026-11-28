@@ -10,6 +10,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from supabase import Client, create_client
 
 load_dotenv()
@@ -256,8 +258,8 @@ scheduler.add_job(run_market_scan, "interval", minutes=15)
 scheduler.start()
 
 
-@app.get("/")
-def root():
+@app.get("/api/health")
+def health_check():
     return {
         "service": "LIQUID CASH Engine",
         "status": "running",
@@ -308,3 +310,41 @@ def get_signals():
         return res.data or []
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# --- Serve Built React Frontend ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIST = next(
+    (
+        candidate
+        for candidate in [
+            os.path.join(BASE_DIR, "frontend", "dist"),
+            os.path.join(BASE_DIR, "dist"),
+        ]
+        if os.path.exists(candidate)
+    ),
+    None,
+)
+
+if FRONTEND_DIST:
+    assets_dir = os.path.join(FRONTEND_DIST, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        file_path = os.path.join(FRONTEND_DIST, full_path)
+        if full_path and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+else:
+    @app.get("/")
+    def root_fallback():
+        return {
+            "service": "LIQUID CASH Engine",
+            "status": "running",
+            "pairs": PAIRS,
+            "note": "Frontend dist folder not built yet.",
+        }
