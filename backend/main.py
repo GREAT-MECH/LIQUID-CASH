@@ -312,7 +312,7 @@ def get_signals():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# --- Serve Built React Frontend ---
+# --- Serve Built React Frontend (supports backend/ root directory) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIST = next(
     (
@@ -320,6 +320,8 @@ FRONTEND_DIST = next(
         for candidate in [
             os.path.join(BASE_DIR, "frontend", "dist"),
             os.path.join(BASE_DIR, "dist"),
+            os.path.join(BASE_DIR, "..", "frontend", "dist"),
+            os.path.join(BASE_DIR, "..", "dist"),
         ]
         if os.path.exists(candidate)
     ),
