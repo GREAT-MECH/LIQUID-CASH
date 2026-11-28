@@ -185,11 +185,12 @@ def analyze_maee_liquidity(
     ignore_session: bool = False,
 ):
     """
-    Major Liquidity Sweep & Trend Continuation Strategy (Strict 1:3 R:R):
-    - Identifies major 60-candle BSL (high pool) and SSL (low pool)
-    - Separates Major Sweep Reversals (pierces >= 0.25 ATR past pool + reclaims inside)
-      from Trend Pullback Continuations (aligned EMA 50/200 + strong rejection at value)
-    - Uses a 0.85 ATR stop-loss cushion past the extreme to reduce wick-outs, with 1:3 TP
+    MAEE & Liquidity Continuation Strategy (Strict 1:3 R:R):
+    - Identifies major 60-candle BSL (high liquidity) and SSL (low liquidity)
+    - When major liquidity is swept, looks for continuation/retest in the sweep
+      direction (BSL taken -> bullish continuation; SSL taken -> bearish continuation)
+      rather than fading straight into a swept pool
+    - Enforces 1:3 Take Profit = Entry +/- (3 * Risk)
     """
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
@@ -211,13 +212,13 @@ def analyze_maee_liquidity(
     ).max(axis=1)
     work_df["atr"] = tr.rolling(14).mean()
 
-    # Major liquidity pools over a 60-candle institutional window
     lookback = work_df.iloc[-63:-4] if len(work_df) >= 67 else work_df.iloc[:-2]
     bsl = float(lookback["high"].max())
     ssl = float(lookback["low"].min())
 
     curr = work_df.iloc[-1]
     prev = work_df.iloc[-2] if len(work_df) >= 2 else curr
+    recent_3 = work_df.iloc[-4:-1] if len(work_df) >= 4 else work_df.iloc[:-1]
     atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else 0.0005
 
     if ignore_session and "datetime" in curr:
@@ -237,55 +238,20 @@ def analyze_maee_liquidity(
     ema50_val = float(curr["ema50"])
     ema200_val = float(curr["ema200"])
 
-    # Clear trend alignment
-    strong_uptrend = close_price > ema200_val and ema50_val > ema200_val
-    strong_downtrend = close_price < ema200_val and ema50_val < ema200_val
-
-    # Major sweep requires pushing at least 0.25 ATR past the major pool and closing back inside
     sweep_margin = 0.25 * atr
-    major_ssl_sweep_reversal = (
-        (low_price <= (ssl - sweep_margin) and close_price > ssl and close_price > open_price)
-        or (
-            float(prev["low"]) <= (ssl - sweep_margin)
-            and float(prev["close"]) > ssl
-            and close_price > open_price
-            and close_price > float(prev["close"])
-        )
-    )
-    major_bsl_sweep_reversal = (
-        (high_price >= (bsl + sweep_margin) and close_price < bsl and close_price < open_price)
-        or (
-            float(prev["high"]) >= (bsl + sweep_margin)
-            and float(prev["close"]) < bsl
-            and close_price < open_price
-            and close_price < float(prev["close"])
-        )
-    )
+    # Major BSL taken recently and price holding/continuing higher
+    bsl_taken_bull = (float(recent_3["high"].max()) >= (bsl + sweep_margin)) and (close_price > bsl) and (close_price > open_price)
+    # Major SSL taken recently and price holding/continuing lower
+    ssl_taken_bear = (float(recent_3["low"].min()) <= (ssl - sweep_margin)) and (close_price < ssl) and (close_price < open_price)
 
     body = abs(close_price - open_price)
     candle_range = max(high_price - low_price, 1e-9)
-    lower_wick = min(open_price, close_price) - low_price
-    upper_wick = high_price - max(open_price, close_price)
+    strong_bull_candle = (close_price > open_price) and (body >= 0.4 * candle_range)
+    strong_bear_candle = (close_price < open_price) and (body >= 0.4 * candle_range)
 
-    # Strong rejection / continuation candle rules (avoid weak/indecision candles)
-    strong_bull_rejection = (close_price > open_price) and (body >= 0.35 * candle_range or lower_wick >= 1.8 * max(body, 1e-9))
-    strong_bear_rejection = (close_price < open_price) and (body >= 0.35 * candle_range or upper_wick >= 1.8 * max(body, 1e-9))
+    bull_trend_cont = (close_price > ema200_val) and (ema50_val > ema200_val) and strong_bull_candle and (abs(low_price - ema50_val) <= 0.7 * atr)
+    bear_trend_cont = (close_price < ema200_val) and (ema50_val < ema200_val) and strong_bear_candle and (abs(high_price - ema50_val) <= 0.7 * atr)
 
-    # Trend continuation pullback to EMA50 without breaking major structure
-    bull_continuation = (
-        strong_uptrend
-        and strong_bull_rejection
-        and low_price > ssl
-        and abs(low_price - ema50_val) <= (0.65 * atr)
-    )
-    bear_continuation = (
-        strong_downtrend
-        and strong_bear_rejection
-        and high_price < bsl
-        and abs(high_price - ema50_val) <= (0.65 * atr)
-    )
-
-    # MAEE Excursion diagnostics
     recent_window = work_df.iloc[-12:]
     swing_origin = float(recent_window.iloc[0]["open"])
     if close_price >= swing_origin:
@@ -300,57 +266,53 @@ def analyze_maee_liquidity(
     mae_pips = round(mae_move * pip_mult, 1)
 
     signal: Optional[Dict[str, Any]] = None
-    sl_buffer = 0.85 * atr
+    sl_buffer = 0.75 * atr
 
-    if session_allowed and (major_ssl_sweep_reversal or bull_continuation):
-        is_sweep = major_ssl_sweep_reversal
-        setup_label = "Major SSL Sweep Reversal" if is_sweep else "Uptrend Continuation"
+    if session_allowed and (bsl_taken_bull or bull_trend_cont):
+        setup_label = "BSL Sweep Continuation" if bsl_taken_bull else "Bullish Trend Continuation"
         entry = close_price
-        extreme_low = min(low_price, float(prev["low"]), ssl if is_sweep else low_price)
-        sl_raw = extreme_low - sl_buffer
+        sl_anchor = bsl if bsl_taken_bull else min(low_price, float(prev["low"]))
+        sl_raw = sl_anchor - sl_buffer
         risk = entry - sl_raw
 
         if (0.75 * atr) <= risk <= (2.5 * atr):
             tp_raw = entry + (3.0 * risk)
-            if tp_raw <= bsl + (1.25 * atr):
-                signal = {
-                    "pair": symbol,
-                    "timeframe": tf,
-                    "direction": "BUY",
-                    "market_structure": f"{session_name} · {setup_label}",
-                    "liquidity_zone": format_price(symbol, ssl),
-                    "entry_price": format_price(symbol, entry),
-                    "stop_loss": format_price(symbol, sl_raw),
-                    "take_profit_liquidity": format_price(symbol, tp_raw),
-                    "trailing_atr_exit": format_price(symbol, entry + risk),
-                    "candle_pattern": setup_label,
-                    "status": "ACTIVE",
-                }
+            signal = {
+                "pair": symbol,
+                "timeframe": tf,
+                "direction": "BUY",
+                "market_structure": f"{session_name} · {setup_label}",
+                "liquidity_zone": format_price(symbol, bsl if bsl_taken_bull else ssl),
+                "entry_price": format_price(symbol, entry),
+                "stop_loss": format_price(symbol, sl_raw),
+                "take_profit_liquidity": format_price(symbol, tp_raw),
+                "trailing_atr_exit": format_price(symbol, entry + risk),
+                "candle_pattern": setup_label,
+                "status": "ACTIVE",
+            }
 
-    elif session_allowed and (major_bsl_sweep_reversal or bear_continuation):
-        is_sweep = major_bsl_sweep_reversal
-        setup_label = "Major BSL Sweep Reversal" if is_sweep else "Downtrend Continuation"
+    elif session_allowed and (ssl_taken_bear or bear_trend_cont):
+        setup_label = "SSL Sweep Continuation" if ssl_taken_bear else "Bearish Trend Continuation"
         entry = close_price
-        extreme_high = max(high_price, float(prev["high"]), bsl if is_sweep else high_price)
-        sl_raw = extreme_high + sl_buffer
+        sl_anchor = ssl if ssl_taken_bear else max(high_price, float(prev["high"]))
+        sl_raw = sl_anchor + sl_buffer
         risk = sl_raw - entry
 
         if (0.75 * atr) <= risk <= (2.5 * atr):
             tp_raw = entry - (3.0 * risk)
-            if tp_raw >= ssl - (1.25 * atr):
-                signal = {
-                    "pair": symbol,
-                    "timeframe": tf,
-                    "direction": "SELL",
-                    "market_structure": f"{session_name} · {setup_label}",
-                    "liquidity_zone": format_price(symbol, bsl),
-                    "entry_price": format_price(symbol, entry),
-                    "stop_loss": format_price(symbol, sl_raw),
-                    "take_profit_liquidity": format_price(symbol, tp_raw),
-                    "trailing_atr_exit": format_price(symbol, entry - risk),
-                    "candle_pattern": setup_label,
-                    "status": "ACTIVE",
-                }
+            signal = {
+                "pair": symbol,
+                "timeframe": tf,
+                "direction": "SELL",
+                "market_structure": f"{session_name} · {setup_label}",
+                "liquidity_zone": format_price(symbol, ssl if ssl_taken_bear else bsl),
+                "entry_price": format_price(symbol, entry),
+                "stop_loss": format_price(symbol, sl_raw),
+                "take_profit_liquidity": format_price(symbol, tp_raw),
+                "trailing_atr_exit": format_price(symbol, entry - risk),
+                "candle_pattern": setup_label,
+                "status": "ACTIVE",
+            }
 
     levels = {
         "bsl": format_price(symbol, bsl),
