@@ -188,8 +188,8 @@ def find_swing_liquidity_pools(
     left_right: int = 3,
 ) -> Tuple[float, int, float, int]:
     """
-    Finds major swing-pivot highs (BSL) and swing-pivot lows (SSL) across
-    the lookback window so liquidity sweeps and order-flow reversals can be evaluated.
+    Finds swing-pivot highs (BSL) and swing-pivot lows (SSL) across
+    the lookback window for 1H / 4H liquidity sweep analysis.
     """
     n = len(df)
     start_idx = max(left_right, n - window_bars)
@@ -245,10 +245,10 @@ def analyze_maee_liquidity(
     ignore_session: bool = False,
 ):
     """
-    Swing Liquidity Sweep -> Reversal / Order Flow -> Order Block Pullback (1:3 R:R):
-    - Detects BSL or SSL liquidity sweep followed by reversal momentum
+    4H/1H Swing Liquidity Sweep -> Reversal / Order Flow -> Order Block Pullback (1:3 R:R):
+    - Detects BSL or SSL sweep followed by reversal momentum
     - Enters on pullback/retest into the order block / order-flow zone
-    - Sets Stop Loss 1.5 pips beyond the swept liquidity extreme
+    - Places Stop Loss 2.0 pips beyond the extreme swept liquidity point
     - Sets Take Profit at an exact 1:3 risk-to-reward ratio
     """
     symbol = normalize_pair(pair)
@@ -291,12 +291,12 @@ def analyze_maee_liquidity(
     high_price = float(curr["high"])
     low_price = float(curr["low"])
 
-    sl_pad = 1.5 * pip_size
-    ob_tol = 0.50 * atr
+    sl_pad = 2.0 * pip_size
+    ob_tol = 0.75 * atr
     signal: Optional[Dict[str, Any]] = None
 
     # --- Bearish Reversal After BSL Sweep + Order Block / Order Flow Pullback ---
-    search_start_bear = max(bsl_idx + 1, n - 18)
+    search_start_bear = max(bsl_idx + 1, n - 24)
     sweep_high_bear: Optional[float] = None
     sweep_pos_bear: Optional[int] = None
     for k in range(search_start_bear, n - 1):
@@ -309,9 +309,9 @@ def analyze_maee_liquidity(
     if sweep_high_bear is not None and sweep_pos_bear is not None:
         ob_top: Optional[float] = None
         ob_bot: Optional[float] = None
-        for b_idx in range(sweep_pos_bear, max(0, sweep_pos_bear - 8), -1):
+        for b_idx in range(sweep_pos_bear, max(0, sweep_pos_bear - 12), -1):
             b_c = work_df.iloc[b_idx]
-            if float(b_c["close"]) > float(b_c["open"]):
+            if float(b_c["close"]) >= float(b_c["open"]):
                 ob_top = float(b_c["high"])
                 ob_bot = float(b_c["low"])
                 break
@@ -319,7 +319,7 @@ def analyze_maee_liquidity(
         after_sweep_bear = work_df.iloc[sweep_pos_bear + 1 : n - 1]
         bearish_reversal = (
             len(after_sweep_bear) >= 1
-            and float(after_sweep_bear["close"].min()) < float(work_df.iloc[sweep_pos_bear]["low"])
+            and float(after_sweep_bear["close"].min()) <= float(work_df.iloc[sweep_pos_bear]["low"])
             and float(after_sweep_bear["high"].max()) <= (sweep_high_bear + sl_pad)
         )
 
@@ -328,14 +328,14 @@ def analyze_maee_liquidity(
                 (high_price >= (ob_bot - ob_tol))
                 and (low_price <= (ob_top + ob_tol))
                 and (high_price <= (sweep_high_bear + sl_pad))
-                and (close_price < open_price)
+                and (close_price <= open_price)
             )
             if session_allowed and pullback_to_ob_bear:
                 entry = close_price
                 sl_raw = sweep_high_bear + sl_pad
                 risk = sl_raw - entry
-                min_risk = 2.0 * pip_size
-                max_risk = 4.0 * atr
+                min_risk = 1.5 * pip_size
+                max_risk = 5.0 * atr
                 if min_risk <= risk <= max_risk:
                     tp_raw = entry - (3.0 * risk)
                     signal = {
@@ -354,7 +354,7 @@ def analyze_maee_liquidity(
 
     # --- Bullish Reversal After SSL Sweep + Order Block / Order Flow Pullback ---
     if signal is None:
-        search_start_bull = max(ssl_idx + 1, n - 18)
+        search_start_bull = max(ssl_idx + 1, n - 24)
         sweep_low_bull: Optional[float] = None
         sweep_pos_bull: Optional[int] = None
         for k in range(search_start_bull, n - 1):
@@ -367,9 +367,9 @@ def analyze_maee_liquidity(
         if sweep_low_bull is not None and sweep_pos_bull is not None:
             ob_top_b: Optional[float] = None
             ob_bot_b: Optional[float] = None
-            for b_idx in range(sweep_pos_bull, max(0, sweep_pos_bull - 8), -1):
+            for b_idx in range(sweep_pos_bull, max(0, sweep_pos_bull - 12), -1):
                 b_c = work_df.iloc[b_idx]
-                if float(b_c["close"]) < float(b_c["open"]):
+                if float(b_c["close"]) <= float(b_c["open"]):
                     ob_top_b = float(b_c["high"])
                     ob_bot_b = float(b_c["low"])
                     break
@@ -377,7 +377,7 @@ def analyze_maee_liquidity(
             after_sweep_bull = work_df.iloc[sweep_pos_bull + 1 : n - 1]
             bullish_reversal = (
                 len(after_sweep_bull) >= 1
-                and float(after_sweep_bull["close"].max()) > float(work_df.iloc[sweep_pos_bull]["high"])
+                and float(after_sweep_bull["close"].max()) >= float(work_df.iloc[sweep_pos_bull]["high"])
                 and float(after_sweep_bull["low"].min()) >= (sweep_low_bull - sl_pad)
             )
 
@@ -386,14 +386,14 @@ def analyze_maee_liquidity(
                     (low_price <= (ob_top_b + ob_tol))
                     and (high_price >= (ob_bot_b - ob_tol))
                     and (low_price >= (sweep_low_bull - sl_pad))
-                    and (close_price > open_price)
+                    and (close_price >= open_price)
                 )
                 if session_allowed and pullback_to_ob_bull:
                     entry = close_price
                     sl_raw = sweep_low_bull - sl_pad
                     risk = entry - sl_raw
-                    min_risk = 2.0 * pip_size
-                    max_risk = 4.0 * atr
+                    min_risk = 1.5 * pip_size
+                    max_risk = 5.0 * atr
                     if min_risk <= risk <= max_risk:
                         tp_raw = entry + (3.0 * risk)
                         signal = {
@@ -569,7 +569,7 @@ def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
                     f"• *Setup:* {signal['candle_pattern']}\n"
                     f"• *Swept Pool:* `{signal['liquidity_zone']}`\n"
                     f"• *Entry:* `{signal['entry_price']}`\n"
-                    f"• *Stop Loss:* `{signal['stop_loss']}`\n"
+                    f"• *Stop Loss (2 pips):* `{signal['stop_loss']}`\n"
                     f"• *Take Profit (1:3):* `{signal['take_profit_liquidity']}`"
                 )
                 send_telegram(msg)
