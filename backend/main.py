@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -92,6 +92,26 @@ def parse_candle_timestamp(raw_dt: Any) -> int:
     return int(datetime.fromisoformat(text).timestamp())
 
 
+def get_active_session() -> Tuple[bool, str]:
+    """Check if current UTC time is inside active London or New York liquidity sessions (Mon-Fri)."""
+    now_utc = datetime.now(timezone.utc)
+    weekday = now_utc.weekday()  # 0=Mon ... 6=Sun
+    hour = now_utc.hour
+
+    # Weekend market closure check (Fri 22:00 UTC -> Sun 22:00 UTC)
+    if weekday == 5 or (weekday == 4 and hour >= 22) or (weekday == 6 and hour < 22):
+        return False, "Weekend Market Closed"
+
+    # London (07:00-16:00 UTC) & New York (12:00-21:00 UTC)
+    if 12 <= hour < 16:
+        return True, "London / NY Overlap (Peak Liquidity)"
+    if 7 <= hour < 12:
+        return True, "London Session"
+    if 16 <= hour < 21:
+        return True, "New York Session"
+    return False, "Asian / Low-Liquidity Rollover (Filtered)"
+
+
 def send_telegram(message: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -146,7 +166,7 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250, force_
     if "values" not in payload or not payload["values"]:
         detail = str(payload.get("message", "No candle values returned from TwelveData"))
         if "run out of API credits" in detail.lower() or "429" in detail or "limit" in detail.lower():
-            QUOTA_EXHAUSTED_UNTIL = now + 900  # Pause external calls for 15 min
+            QUOTA_EXHAUSTED_UNTIL = now + 900
             if cache_key in CANDLE_CACHE:
                 return CANDLE_CACHE[cache_key][1].copy()
         raise ValueError(f"TwelveData error for {symbol} ({tf}): {detail}")
@@ -164,20 +184,22 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
     pip_mult = get_pip_multiplier(symbol)
+    in_session, session_name = get_active_session()
 
     work_df = df.copy()
     work_df.loc[:, "ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
     work_df.loc[:, "ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
     work_df.loc[:, "ema20"] = work_df["close"].ewm(span=20, adjust=False).mean()
 
-    prev_close = work_df["close"].shift(1)
-    tr = np.maximum(
-        work_df["high"] - work_df["low"],
-        np.maximum(
+    prev_close = work_df["close"].shift(1).fillna(work_df["close"])
+    tr = pd.concat(
+        [
+            work_df["high"] - work_df["low"],
             (work_df["high"] - prev_close).abs(),
             (work_df["low"] - prev_close).abs(),
-        ),
-    )
+        ],
+        axis=1,
+    ).max(axis=1)
     work_df.loc[:, "atr"] = tr.rolling(14).mean()
 
     lookback = work_df.iloc[-35:-3] if len(work_df) >= 38 else work_df.iloc[:-1]
@@ -249,7 +271,6 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
     dist_bsl_pips = round((bsl - close_price) * pip_mult, 1)
     dist_ssl_pips = round((close_price - ssl) * pip_mult, 1)
 
-    # Dynamic Exit Diagnostic state
     if bsl_sweep_reclaim:
         exit_state = "EXIT LONGS / BSL SWEPT"
         exit_detail = f"Buy-side stops swept above {format_price(symbol, bsl)} & reclaimed"
@@ -270,7 +291,7 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
         exit_detail = f"{dist_bsl_pips}p to BSL · {dist_ssl_pips}p to SSL"
 
     signal: Optional[Dict[str, Any]] = None
-    if (uptrend and near_value_bull and (bull_pin or bull_engulf)) or ssl_sweep_reclaim:
+    if in_session and ((uptrend and near_value_bull and (bull_pin or bull_engulf)) or ssl_sweep_reclaim):
         pattern = "SSL Liquidity Sweep + Reclaim" if ssl_sweep_reclaim else ("Bullish Engulfing" if bull_engulf else "Bullish Pin Bar")
         entry = close_price
         sl = format_price(symbol, min(low_price, ssl) - (0.5 * atr))
@@ -280,7 +301,7 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
             "pair": symbol,
             "timeframe": tf,
             "direction": "BUY",
-            "market_structure": "Bullish Sweep Reclaim" if ssl_sweep_reclaim else "Bullish (Above 200 EMA)",
+            "market_structure": f"{session_name} · Bullish",
             "liquidity_zone": format_price(symbol, ssl),
             "entry_price": format_price(symbol, entry),
             "stop_loss": sl,
@@ -289,7 +310,7 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
             "candle_pattern": pattern,
             "status": "ACTIVE",
         }
-    elif (downtrend and near_value_bear and (bear_pin or bear_engulf)) or bsl_sweep_reclaim:
+    elif in_session and ((downtrend and near_value_bear and (bear_pin or bear_engulf)) or bsl_sweep_reclaim):
         pattern = "BSL Liquidity Sweep + Reclaim" if bsl_sweep_reclaim else ("Bearish Engulfing" if bear_engulf else "Bearish Pin Bar")
         entry = close_price
         sl = format_price(symbol, max(high_price, bsl) + (0.5 * atr))
@@ -299,7 +320,7 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
             "pair": symbol,
             "timeframe": tf,
             "direction": "SELL",
-            "market_structure": "Bearish Sweep Reclaim" if bsl_sweep_reclaim else "Bearish (Below 200 EMA)",
+            "market_structure": f"{session_name} · Bearish",
             "liquidity_zone": format_price(symbol, bsl),
             "entry_price": format_price(symbol, entry),
             "stop_loss": sl,
@@ -323,12 +344,19 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
         "dist_ssl_pips": dist_ssl_pips,
         "exit_state": exit_state,
         "exit_detail": exit_detail,
+        "session": session_name,
+        "in_session": in_session,
     }
 
     return signal, levels
 
 
 def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    in_session, session_name = get_active_session()
+    if not in_session and not force_refresh:
+        print(f"Skipping automated scan ({session_name})")
+        return []
+
     triggered: List[Dict[str, Any]] = []
     for pair in PAIRS:
         try:
@@ -340,7 +368,7 @@ def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
                     supabase.table("signals").insert(signal).execute()
                 msg = (
                     f"💧 *LIQUID CASH SIGNAL — {signal['pair']} ({signal['direction']})*\n"
-                    f"• *Structure:* {signal['market_structure']}\n"
+                    f"• *Session & Structure:* {signal['market_structure']}\n"
                     f"• *Trigger:* {signal['candle_pattern']}\n"
                     f"• *Entry:* `{signal['entry_price']}`\n"
                     f"• *Stop Loss:* `{signal['stop_loss']}`\n"
@@ -359,10 +387,14 @@ scheduler.start()
 
 
 @app.get("/api/health")
+@app.head("/api/health")
 def health_check():
+    in_session, session_name = get_active_session()
     return {
         "service": "LIQUID CASH Engine",
         "status": "running",
+        "session": session_name,
+        "in_session": in_session,
         "pairs": PAIRS,
         "quota_paused": time.time() < QUOTA_EXHAUSTED_UNTIL,
     }
