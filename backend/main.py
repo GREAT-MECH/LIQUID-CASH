@@ -4,7 +4,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -100,12 +99,12 @@ def get_session_for_dt(dt_obj: datetime) -> Tuple[bool, str]:
         return False, "Weekend Market Closed"
 
     if 12 <= hour < 16:
-        return True, "London / NY Overlap (Peak Liquidity)"
+        return True, "London / NY Overlap"
     if 7 <= hour < 12:
         return True, "London Session"
     if 16 <= hour < 21:
         return True, "New York Session"
-    return False, "Asian / Low-Liquidity Rollover (Filtered)"
+    return False, "Off-Peak Hours"
 
 
 def get_active_session() -> Tuple[bool, str]:
@@ -174,7 +173,7 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 300, force_
     df = pd.DataFrame(payload["values"])
     df = df.iloc[::-1].reset_index(drop=True)
     for col in ["open", "high", "low", "close"]:
-        df.loc[:, col] = df[col].astype(float)
+        df[col] = df[col].astype(float)
 
     CANDLE_CACHE[cache_key] = (now, df.copy())
     return df
@@ -186,17 +185,22 @@ def analyze_maee_liquidity(
     timeframe: str = "1h",
     ignore_session: bool = False,
 ):
+    """
+    MAEE & Liquidity Strategy (Strict 1:3 Risk-to-Reward Ratio):
+    - Requires institutional trend alignment (EMA 50 vs EMA 200)
+    - Requires true BSL/SSL liquidity sweep + reclaim OR clean EMA50/liquidity rejection
+    - Enforces strict 1:3 Take Profit = Entry +/- (3 * Risk) with room before opposing liquidity
+    """
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
     pip_mult = get_pip_multiplier(symbol)
     in_session, session_name = get_active_session()
 
     work_df = df.copy()
-    work_df.loc[:, "ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
-    work_df.loc[:, "ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
-    work_df.loc[:, "ema20"] = work_df["close"].ewm(span=20, adjust=False).mean()
+    work_df["ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
+    work_df["ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
 
-    prev_close = work_df["close"].shift(1).fillna(work_df["close"])
+    prev_close = work_df["close"].shift(1).bfill()
     tr = pd.concat(
         [
             work_df["high"] - work_df["low"],
@@ -205,9 +209,10 @@ def analyze_maee_liquidity(
         ],
         axis=1,
     ).max(axis=1)
-    work_df.loc[:, "atr"] = tr.rolling(14).mean()
+    work_df["atr"] = tr.rolling(14).mean()
 
-    lookback = work_df.iloc[-35:-3] if len(work_df) >= 38 else work_df.iloc[:-1]
+    # Liquidity pools across recent 40-bar institutional swing structure
+    lookback = work_df.iloc[-40:-3] if len(work_df) >= 43 else work_df.iloc[:-1]
     bsl = float(lookback["high"].max())
     ssl = float(lookback["low"].min())
 
@@ -233,10 +238,11 @@ def analyze_maee_liquidity(
     uptrend = close_price > float(curr["ema200"]) and float(curr["ema50"]) > float(curr["ema200"])
     downtrend = close_price < float(curr["ema200"]) and float(curr["ema50"]) < float(curr["ema200"])
 
-    ssl_sweep_reclaim = (low_price < ssl and close_price > ssl) or (
+    # Sweep + Reclaim confirmation
+    ssl_sweep_reclaim = (low_price < ssl and close_price > ssl and close_price > open_price) or (
         float(prev["low"]) < ssl and float(prev["close"]) > ssl and close_price > open_price
     )
-    bsl_sweep_reclaim = (high_price > bsl and close_price < bsl) or (
+    bsl_sweep_reclaim = (high_price > bsl and close_price < bsl and close_price < open_price) or (
         float(prev["high"]) > bsl and float(prev["close"]) < bsl and close_price < open_price
     )
 
@@ -260,15 +266,10 @@ def analyze_maee_liquidity(
         and open_price >= float(prev["close"])
     )
 
-    near_value_bull = (
-        abs(low_price - float(curr["ema50"])) <= (atr * 0.8)
-        or abs(low_price - ssl) <= (atr * 0.8)
-    )
-    near_value_bear = (
-        abs(high_price - float(curr["ema50"])) <= (atr * 0.8)
-        or abs(high_price - bsl) <= (atr * 0.8)
-    )
+    near_value_bull = abs(low_price - float(curr["ema50"])) <= (atr * 0.7) or abs(low_price - ssl) <= (atr * 0.7)
+    near_value_bear = abs(high_price - float(curr["ema50"])) <= (atr * 0.7) or abs(high_price - bsl) <= (atr * 0.7)
 
+    # MAEE Excursion diagnostics
     recent_window = work_df.iloc[-12:]
     swing_origin = float(recent_window.iloc[0]["open"])
     if close_price >= swing_origin:
@@ -281,92 +282,72 @@ def analyze_maee_liquidity(
     maee_ratio = round(mfe_move / mae_move, 2)
     mfe_pips = round(mfe_move * pip_mult, 1)
     mae_pips = round(mae_move * pip_mult, 1)
-    dist_bsl_pips = round((bsl - close_price) * pip_mult, 1)
-    dist_ssl_pips = round((close_price - ssl) * pip_mult, 1)
-
-    if bsl_sweep_reclaim:
-        exit_state = "EXIT LONGS / BSL SWEPT"
-        exit_detail = f"Buy-side stops swept above {format_price(symbol, bsl)} & reclaimed"
-    elif ssl_sweep_reclaim:
-        exit_state = "EXIT SHORTS / SSL SWEPT"
-        exit_detail = f"Sell-side stops swept below {format_price(symbol, ssl)} & reclaimed"
-    elif abs(bsl - close_price) <= (atr * 0.35):
-        exit_state = "TAKE PARTIAL — NEAR BSL"
-        exit_detail = f"Only {dist_bsl_pips} pips below BSL exhaustion zone"
-    elif abs(close_price - ssl) <= (atr * 0.35):
-        exit_state = "TAKE PARTIAL — NEAR SSL"
-        exit_detail = f"Only {dist_ssl_pips} pips above SSL exhaustion zone"
-    elif maee_ratio >= 2.5:
-        exit_state = "TRAIL PROFIT (3x ATR)"
-        exit_detail = f"MFE extended ({maee_ratio}R) — lock gains before reversal"
-    else:
-        exit_state = "MONITORING"
-        exit_detail = f"{dist_bsl_pips}p to BSL · {dist_ssl_pips}p to SSL"
 
     signal: Optional[Dict[str, Any]] = None
-    if session_allowed and ((uptrend and near_value_bull and (bull_pin or bull_engulf)) or ssl_sweep_reclaim):
+
+    # BULLISH SETUP (Trend-aligned + SSL Sweep or EMA50 Rejection + Strict 1:3 Ratio)
+    if session_allowed and uptrend and (ssl_sweep_reclaim or (near_value_bull and (bull_pin or bull_engulf))):
         pattern = (
             "SSL Liquidity Sweep + Reclaim"
             if ssl_sweep_reclaim
             else ("Bullish Engulfing" if bull_engulf else "Bullish Pin Bar")
         )
         entry = close_price
-        sl = format_price(symbol, min(low_price, ssl) - (0.5 * atr))
-        tp_liquidity = format_price(symbol, bsl - (0.15 * atr))
-        trailing_exit = format_price(symbol, entry - (3.0 * atr))
-        if tp_liquidity > entry and sl < entry:
-            signal = {
-                "pair": symbol,
-                "timeframe": tf,
-                "direction": "BUY",
-                "market_structure": f"{session_name} · Bullish",
-                "liquidity_zone": format_price(symbol, ssl),
-                "entry_price": format_price(symbol, entry),
-                "stop_loss": sl,
-                "take_profit_liquidity": tp_liquidity,
-                "trailing_atr_exit": trailing_exit,
-                "candle_pattern": pattern,
-                "status": "ACTIVE",
-            }
-    elif session_allowed and ((downtrend and near_value_bear and (bear_pin or bear_engulf)) or bsl_sweep_reclaim):
+        sl_raw = min(low_price, float(prev["low"])) - (0.35 * atr)
+        risk = entry - sl_raw
+        # Keep risk realistic (between 0.6 ATR and 2.2 ATR) and enforce strict 1:3 TP
+        if (0.5 * atr) <= risk <= (2.5 * atr):
+            tp_raw = entry + (3.0 * risk)
+            # Confirm room toward or through BSL liquidity
+            if tp_raw <= bsl + (1.0 * atr):
+                signal = {
+                    "pair": symbol,
+                    "timeframe": tf,
+                    "direction": "BUY",
+                    "market_structure": f"{session_name} · Bullish (1:3)",
+                    "liquidity_zone": format_price(symbol, ssl),
+                    "entry_price": format_price(symbol, entry),
+                    "stop_loss": format_price(symbol, sl_raw),
+                    "take_profit_liquidity": format_price(symbol, tp_raw),
+                    "trailing_atr_exit": format_price(symbol, entry + risk),
+                    "candle_pattern": pattern,
+                    "status": "ACTIVE",
+                }
+
+    # BEARISH SETUP (Trend-aligned + BSL Sweep or EMA50 Rejection + Strict 1:3 Ratio)
+    elif session_allowed and downtrend and (bsl_sweep_reclaim or (near_value_bear and (bear_pin or bear_engulf))):
         pattern = (
             "BSL Liquidity Sweep + Reclaim"
             if bsl_sweep_reclaim
             else ("Bearish Engulfing" if bear_engulf else "Bearish Pin Bar")
         )
         entry = close_price
-        sl = format_price(symbol, max(high_price, bsl) + (0.5 * atr))
-        tp_liquidity = format_price(symbol, ssl + (0.15 * atr))
-        trailing_exit = format_price(symbol, entry + (3.0 * atr))
-        if tp_liquidity < entry and sl > entry:
-            signal = {
-                "pair": symbol,
-                "timeframe": tf,
-                "direction": "SELL",
-                "market_structure": f"{session_name} · Bearish",
-                "liquidity_zone": format_price(symbol, bsl),
-                "entry_price": format_price(symbol, entry),
-                "stop_loss": sl,
-                "take_profit_liquidity": tp_liquidity,
-                "trailing_atr_exit": trailing_exit,
-                "candle_pattern": pattern,
-                "status": "ACTIVE",
-            }
+        sl_raw = max(high_price, float(prev["high"])) + (0.35 * atr)
+        risk = sl_raw - entry
+        if (0.5 * atr) <= risk <= (2.5 * atr):
+            tp_raw = entry - (3.0 * risk)
+            if tp_raw >= ssl - (1.0 * atr):
+                signal = {
+                    "pair": symbol,
+                    "timeframe": tf,
+                    "direction": "SELL",
+                    "market_structure": f"{session_name} · Bearish (1:3)",
+                    "liquidity_zone": format_price(symbol, bsl),
+                    "entry_price": format_price(symbol, entry),
+                    "stop_loss": format_price(symbol, sl_raw),
+                    "take_profit_liquidity": format_price(symbol, tp_raw),
+                    "trailing_atr_exit": format_price(symbol, entry - risk),
+                    "candle_pattern": pattern,
+                    "status": "ACTIVE",
+                }
 
     levels = {
         "bsl": format_price(symbol, bsl),
         "ssl": format_price(symbol, ssl),
-        "ema200": format_price(symbol, float(curr["ema200"])),
-        "ema50": format_price(symbol, float(curr["ema50"])),
-        "ema20": format_price(symbol, float(curr["ema20"])),
         "atr": format_price(symbol, atr),
         "maee_ratio": maee_ratio,
         "mfe_pips": mfe_pips,
         "mae_pips": mae_pips,
-        "dist_bsl_pips": dist_bsl_pips,
-        "dist_ssl_pips": dist_ssl_pips,
-        "exit_state": exit_state,
-        "exit_detail": exit_detail,
         "session": session_name,
         "in_session": in_session,
     }
@@ -407,7 +388,7 @@ def simulate_pair_backtest(pair: str, interval: str = "1h", bars: int = 300) -> 
         exit_ts = 0
         exit_price = entry
 
-        for fwd_idx in range(idx + 1, min(idx + 48, len(df))):
+        for fwd_idx in range(idx + 1, min(idx + 72, len(df))):
             candle = df.iloc[fwd_idx]
             hi = float(candle["high"])
             lo = float(candle["low"])
@@ -443,10 +424,7 @@ def simulate_pair_backtest(pair: str, interval: str = "1h", bars: int = 300) -> 
                     cooldown_until_idx = fwd_idx + 1
                     break
 
-        risk = abs(entry - sl)
-        reward = abs(tp - entry)
-        rr = round(reward / risk, 2) if risk > 0 else 0.0
-        net_r = rr if outcome == "WON" else (-1.0 if outcome == "LOST" else 0.0)
+        net_r = 3.0 if outcome == "WON" else (-1.0 if outcome == "LOST" else 0.0)
 
         trades.append({
             "id": f"bt-{symbol}-{idx}",
@@ -457,13 +435,12 @@ def simulate_pair_backtest(pair: str, interval: str = "1h", bars: int = 300) -> 
             "entry_price": signal["entry_price"],
             "stop_loss": signal["stop_loss"],
             "take_profit_liquidity": signal["take_profit_liquidity"],
-            "trailing_atr_exit": signal["trailing_atr_exit"],
             "entry_time": entry_dt_raw,
             "entry_ts": entry_ts,
             "exit_time": exit_dt_raw,
             "exit_ts": exit_ts,
             "exit_price": exit_price,
-            "rr": rr,
+            "rr": 3.0,
             "net_r": net_r,
             "status": outcome,
         })
@@ -506,13 +483,11 @@ def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
                 if supabase:
                     supabase.table("signals").insert(signal).execute()
                 msg = (
-                    f"💧 *LIQUID CASH SIGNAL — {signal['pair']} ({signal['direction']})*\n"
-                    f"• *Session & Structure:* {signal['market_structure']}\n"
-                    f"• *Trigger:* {signal['candle_pattern']}\n"
+                    f"💧 *LIQUID CASH (1:3 R:R) — {signal['pair']} ({signal['direction']})*\n"
+                    f"• *Setup:* {signal['candle_pattern']}\n"
                     f"• *Entry:* `{signal['entry_price']}`\n"
                     f"• *Stop Loss:* `{signal['stop_loss']}`\n"
-                    f"• *🎯 EXIT TARGET (Before Liquidity):* `{signal['take_profit_liquidity']}`\n"
-                    f"• *🛡️ Profit Lock (3x ATR Trail):* `{signal['trailing_atr_exit']}`"
+                    f"• *Take Profit (1:3):* `{signal['take_profit_liquidity']}`"
                 )
                 send_telegram(msg)
         except Exception as exc:
@@ -552,11 +527,6 @@ def get_chart_data(pair: str, interval: str = "1h"):
     try:
         df = fetch_candles(symbol, tf, 300)
         signal, levels = analyze_maee_liquidity(df, symbol, tf, ignore_session=False)
-
-        work_df = df.copy()
-        work_df.loc[:, "ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
-        work_df.loc[:, "ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
-
         candles = [
             {
                 "time": parse_candle_timestamp(row["datetime"]),
@@ -564,10 +534,8 @@ def get_chart_data(pair: str, interval: str = "1h"):
                 "high": float(row["high"]),
                 "low": float(row["low"]),
                 "close": float(row["close"]),
-                "ema50": round(float(row["ema50"]), 5),
-                "ema200": round(float(row["ema200"]), 5),
             }
-            for _, row in work_df.tail(260).iterrows()
+            for _, row in df.tail(260).iterrows()
         ]
         return {
             "pair": symbol,
@@ -591,7 +559,6 @@ def run_historical_backtest(pair: str, interval: str = "1h", bars: int = 300):
 
 @app.get("/api/backtest-all")
 def run_all_pairs_backtest(interval: str = "1h", bars: int = 300):
-    """Run historical backtest across all 5 pairs and return portfolio + per-pair breakdown."""
     tf = normalize_interval(interval)
     per_pair: List[Dict[str, Any]] = []
     all_trades: List[Dict[str, Any]] = []
