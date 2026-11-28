@@ -1,7 +1,8 @@
 import os
 import re
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from supabase import Client, create_client
 
 load_dotenv()
@@ -41,9 +43,17 @@ if SUPABASE_URL and SUPABASE_KEY:
 PAIRS: List[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "GBP/JPY", "XAU/USD"]
 VALID_INTERVALS = {"1min", "5min", "15min", "30min", "45min", "1h", "2h", "4h", "1day"}
 
+# In-memory cache to protect Twelve Data 800/day free quota
+CANDLE_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
+CACHE_TTL_SECONDS = 600  # 10 minutes
+QUOTA_EXHAUSTED_UNTIL = 0.0
+
+
+class SignalStatusUpdate(BaseModel):
+    status: str
+
 
 def normalize_pair(raw_pair: str) -> str:
-    """Normalize pair inputs like EUR/USD, EUR-USD, or EURUSD into BASE/QUOTE."""
     cleaned = str(raw_pair or "").split("?")[0].split("[")[0].split("(")[0].strip().upper()
     cleaned = cleaned.replace("-", "/")
     if "/" not in cleaned and len(cleaned) == 6:
@@ -52,14 +62,27 @@ def normalize_pair(raw_pair: str) -> str:
 
 
 def normalize_interval(raw_interval: str) -> str:
-    """Sanitize interval query parameters so stray characters never break TwelveData."""
     cleaned = str(raw_interval or "1h").split("?")[0].split("[")[0].split("(")[0].strip().lower()
     cleaned = re.sub(r"[^a-z0-9]", "", cleaned)
     return cleaned if cleaned in VALID_INTERVALS else "1h"
 
 
+def get_pip_multiplier(pair: str) -> float:
+    symbol = normalize_pair(pair)
+    if "JPY" in symbol:
+        return 100.0
+    if "XAU" in symbol:
+        return 10.0
+    return 10000.0
+
+
+def format_price(pair: str, value: float) -> float:
+    symbol = normalize_pair(pair)
+    decimals = 2 if "XAU" in symbol else (3 if "JPY" in symbol else 5)
+    return round(float(value), decimals)
+
+
 def parse_candle_timestamp(raw_dt: Any) -> int:
-    """Convert TwelveData datetime strings into Unix epoch seconds."""
     text = str(raw_dt).strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -87,14 +110,26 @@ def send_telegram(message: str) -> None:
         print(f"Telegram alert error: {exc}")
 
 
-def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250) -> pd.DataFrame:
+def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250, force_refresh: bool = False) -> pd.DataFrame:
+    global QUOTA_EXHAUSTED_UNTIL
+
     if not TWELVE_DATA_KEY:
         raise ValueError("Missing TWELVE_DATA_KEY environment variable.")
 
     symbol = normalize_pair(pair)
     tf = normalize_interval(interval)
-    size = max(50, min(int(outputsize), 500))
+    cache_key = (symbol, tf)
+    now = time.time()
 
+    if not force_refresh and cache_key in CANDLE_CACHE:
+        cached_at, cached_df = CANDLE_CACHE[cache_key]
+        if (now - cached_at) < CACHE_TTL_SECONDS:
+            return cached_df.copy()
+
+    if now < QUOTA_EXHAUSTED_UNTIL and cache_key in CANDLE_CACHE:
+        return CANDLE_CACHE[cache_key][1].copy()
+
+    size = max(50, min(int(outputsize), 500))
     response = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -109,7 +144,11 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250) -> pd.
     payload = response.json()
 
     if "values" not in payload or not payload["values"]:
-        detail = payload.get("message", "No candle values returned from TwelveData")
+        detail = str(payload.get("message", "No candle values returned from TwelveData"))
+        if "run out of API credits" in detail.lower() or "429" in detail or "limit" in detail.lower():
+            QUOTA_EXHAUSTED_UNTIL = now + 900  # Pause external calls for 15 min
+            if cache_key in CANDLE_CACHE:
+                return CANDLE_CACHE[cache_key][1].copy()
         raise ValueError(f"TwelveData error for {symbol} ({tf}): {detail}")
 
     df = pd.DataFrame(payload["values"])
@@ -117,12 +156,14 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250) -> pd.
     for col in ["open", "high", "low", "close"]:
         df.loc[:, col] = df[col].astype(float)
 
+    CANDLE_CACHE[cache_key] = (now, df.copy())
     return df
 
 
 def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
+    pip_mult = get_pip_multiplier(symbol)
 
     work_df = df.copy()
     work_df.loc[:, "ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
@@ -147,71 +188,120 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
     prev = work_df.iloc[-2] if len(work_df) >= 2 else curr
     atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else 0.0005
 
-    uptrend = float(curr["close"]) > float(curr["ema200"]) and float(curr["ema50"]) > float(curr["ema200"])
-    downtrend = float(curr["close"]) < float(curr["ema200"]) and float(curr["ema50"]) < float(curr["ema200"])
+    close_price = float(curr["close"])
+    open_price = float(curr["open"])
+    high_price = float(curr["high"])
+    low_price = float(curr["low"])
 
-    body = abs(float(curr["close"]) - float(curr["open"]))
-    lower_wick = min(float(curr["open"]), float(curr["close"])) - float(curr["low"])
-    upper_wick = float(curr["high"]) - max(float(curr["open"]), float(curr["close"]))
+    uptrend = close_price > float(curr["ema200"]) and float(curr["ema50"]) > float(curr["ema200"])
+    downtrend = close_price < float(curr["ema200"]) and float(curr["ema50"]) < float(curr["ema200"])
 
-    bull_pin = (lower_wick > body * 2.0) and (float(curr["close"]) > float(curr["open"]))
-    bull_engulf = (
-        float(prev["close"]) < float(prev["open"])
-        and float(curr["close"]) > float(curr["open"])
-        and float(curr["close"]) > float(prev["open"])
-        and float(curr["open"]) <= float(prev["close"])
+    # True Institutional Sweep + Reclaim detection
+    ssl_sweep_reclaim = (low_price < ssl and close_price > ssl) or (
+        float(prev["low"]) < ssl and float(prev["close"]) > ssl and close_price > open_price
+    )
+    bsl_sweep_reclaim = (high_price > bsl and close_price < bsl) or (
+        float(prev["high"]) > bsl and float(prev["close"]) < bsl and close_price < open_price
     )
 
-    bear_pin = (upper_wick > body * 2.0) and (float(curr["close"]) < float(curr["open"]))
+    body = abs(close_price - open_price)
+    lower_wick = min(open_price, close_price) - low_price
+    upper_wick = high_price - max(open_price, close_price)
+
+    bull_pin = (lower_wick > body * 1.8) and (close_price > open_price)
+    bull_engulf = (
+        float(prev["close"]) < float(prev["open"])
+        and close_price > open_price
+        and close_price > float(prev["open"])
+        and open_price <= float(prev["close"])
+    )
+
+    bear_pin = (upper_wick > body * 1.8) and (close_price < open_price)
     bear_engulf = (
         float(prev["close"]) > float(prev["open"])
-        and float(curr["close"]) < float(curr["open"])
-        and float(curr["close"]) < float(prev["open"])
-        and float(curr["open"]) >= float(prev["close"])
+        and close_price < open_price
+        and close_price < float(prev["open"])
+        and open_price >= float(prev["close"])
     )
 
     near_value_bull = (
-        abs(float(curr["low"]) - float(curr["ema50"])) <= (atr * 0.8)
-        or abs(float(curr["low"]) - ssl) <= (atr * 0.8)
+        abs(low_price - float(curr["ema50"])) <= (atr * 0.8)
+        or abs(low_price - ssl) <= (atr * 0.8)
     )
     near_value_bear = (
-        abs(float(curr["high"]) - float(curr["ema50"])) <= (atr * 0.8)
-        or abs(float(curr["high"]) - bsl) <= (atr * 0.8)
+        abs(high_price - float(curr["ema50"])) <= (atr * 0.8)
+        or abs(high_price - bsl) <= (atr * 0.8)
     )
 
+    # Live MAEE (Maximum Favorable vs Adverse Excursion) over recent 12-bar swing
+    recent_window = work_df.iloc[-12:]
+    swing_origin = float(recent_window.iloc[0]["open"])
+    if close_price >= swing_origin:
+        mfe_move = max(0.0, float(recent_window["high"].max()) - swing_origin)
+        mae_move = max(atr * 0.25, swing_origin - float(recent_window["low"].min()))
+    else:
+        mfe_move = max(0.0, swing_origin - float(recent_window["low"].min()))
+        mae_move = max(atr * 0.25, float(recent_window["high"].max()) - swing_origin)
+
+    maee_ratio = round(mfe_move / mae_move, 2)
+    mfe_pips = round(mfe_move * pip_mult, 1)
+    mae_pips = round(mae_move * pip_mult, 1)
+    dist_bsl_pips = round((bsl - close_price) * pip_mult, 1)
+    dist_ssl_pips = round((close_price - ssl) * pip_mult, 1)
+
+    # Dynamic Exit Diagnostic state
+    if bsl_sweep_reclaim:
+        exit_state = "EXIT LONGS / BSL SWEPT"
+        exit_detail = f"Buy-side stops swept above {format_price(symbol, bsl)} & reclaimed"
+    elif ssl_sweep_reclaim:
+        exit_state = "EXIT SHORTS / SSL SWEPT"
+        exit_detail = f"Sell-side stops swept below {format_price(symbol, ssl)} & reclaimed"
+    elif abs(bsl - close_price) <= (atr * 0.35):
+        exit_state = "TAKE PARTIAL — NEAR BSL"
+        exit_detail = f"Only {dist_bsl_pips} pips below BSL exhaustion zone"
+    elif abs(close_price - ssl) <= (atr * 0.35):
+        exit_state = "TAKE PARTIAL — NEAR SSL"
+        exit_detail = f"Only {dist_ssl_pips} pips above SSL exhaustion zone"
+    elif maee_ratio >= 2.5:
+        exit_state = "TRAIL PROFIT (3x ATR)"
+        exit_detail = f"MFE extended ({maee_ratio}R) — lock gains before reversal"
+    else:
+        exit_state = "MONITORING"
+        exit_detail = f"{dist_bsl_pips}p to BSL · {dist_ssl_pips}p to SSL"
+
     signal: Optional[Dict[str, Any]] = None
-    if uptrend and near_value_bull and (bull_pin or bull_engulf):
-        pattern = "Bullish Engulfing" if bull_engulf else "Bullish Pin Bar"
-        entry = float(curr["close"])
-        sl = round(min(float(curr["low"]), ssl) - (0.5 * atr), 5)
-        tp_liquidity = round(bsl - (0.15 * atr), 5)
-        trailing_exit = round(entry - (3.0 * atr), 5)
+    if (uptrend and near_value_bull and (bull_pin or bull_engulf)) or ssl_sweep_reclaim:
+        pattern = "SSL Liquidity Sweep + Reclaim" if ssl_sweep_reclaim else ("Bullish Engulfing" if bull_engulf else "Bullish Pin Bar")
+        entry = close_price
+        sl = format_price(symbol, min(low_price, ssl) - (0.5 * atr))
+        tp_liquidity = format_price(symbol, bsl - (0.15 * atr))
+        trailing_exit = format_price(symbol, entry - (3.0 * atr))
         signal = {
             "pair": symbol,
             "timeframe": tf,
             "direction": "BUY",
-            "market_structure": "Bullish (Above 200 EMA)",
-            "liquidity_zone": round(ssl, 5),
-            "entry_price": round(entry, 5),
+            "market_structure": "Bullish Sweep Reclaim" if ssl_sweep_reclaim else "Bullish (Above 200 EMA)",
+            "liquidity_zone": format_price(symbol, ssl),
+            "entry_price": format_price(symbol, entry),
             "stop_loss": sl,
             "take_profit_liquidity": tp_liquidity,
             "trailing_atr_exit": trailing_exit,
             "candle_pattern": pattern,
             "status": "ACTIVE",
         }
-    elif downtrend and near_value_bear and (bear_pin or bear_engulf):
-        pattern = "Bearish Engulfing" if bear_engulf else "Bearish Pin Bar"
-        entry = float(curr["close"])
-        sl = round(max(float(curr["high"]), bsl) + (0.5 * atr), 5)
-        tp_liquidity = round(ssl + (0.15 * atr), 5)
-        trailing_exit = round(entry + (3.0 * atr), 5)
+    elif (downtrend and near_value_bear and (bear_pin or bear_engulf)) or bsl_sweep_reclaim:
+        pattern = "BSL Liquidity Sweep + Reclaim" if bsl_sweep_reclaim else ("Bearish Engulfing" if bear_engulf else "Bearish Pin Bar")
+        entry = close_price
+        sl = format_price(symbol, max(high_price, bsl) + (0.5 * atr))
+        tp_liquidity = format_price(symbol, ssl + (0.15 * atr))
+        trailing_exit = format_price(symbol, entry + (3.0 * atr))
         signal = {
             "pair": symbol,
             "timeframe": tf,
             "direction": "SELL",
-            "market_structure": "Bearish (Below 200 EMA)",
-            "liquidity_zone": round(bsl, 5),
-            "entry_price": round(entry, 5),
+            "market_structure": "Bearish Sweep Reclaim" if bsl_sweep_reclaim else "Bearish (Below 200 EMA)",
+            "liquidity_zone": format_price(symbol, bsl),
+            "entry_price": format_price(symbol, entry),
             "stop_loss": sl,
             "take_profit_liquidity": tp_liquidity,
             "trailing_atr_exit": trailing_exit,
@@ -220,29 +310,38 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
         }
 
     levels = {
-        "bsl": round(bsl, 5),
-        "ssl": round(ssl, 5),
-        "ema200": round(float(curr["ema200"]), 5),
-        "ema50": round(float(curr["ema50"]), 5),
-        "ema20": round(float(curr["ema20"]), 5),
-        "atr": round(atr, 5),
+        "bsl": format_price(symbol, bsl),
+        "ssl": format_price(symbol, ssl),
+        "ema200": format_price(symbol, float(curr["ema200"])),
+        "ema50": format_price(symbol, float(curr["ema50"])),
+        "ema20": format_price(symbol, float(curr["ema20"])),
+        "atr": format_price(symbol, atr),
+        "maee_ratio": maee_ratio,
+        "mfe_pips": mfe_pips,
+        "mae_pips": mae_pips,
+        "dist_bsl_pips": dist_bsl_pips,
+        "dist_ssl_pips": dist_ssl_pips,
+        "exit_state": exit_state,
+        "exit_detail": exit_detail,
     }
 
     return signal, levels
 
 
-def run_market_scan() -> None:
+def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    triggered: List[Dict[str, Any]] = []
     for pair in PAIRS:
         try:
-            df = fetch_candles(pair, "1h", 250)
+            df = fetch_candles(pair, "1h", 250, force_refresh=force_refresh)
             signal, _ = analyze_maee_liquidity(df, pair, "1h")
             if signal:
+                triggered.append(signal)
                 if supabase:
                     supabase.table("signals").insert(signal).execute()
                 msg = (
                     f"💧 *LIQUID CASH SIGNAL — {signal['pair']} ({signal['direction']})*\n"
                     f"• *Structure:* {signal['market_structure']}\n"
-                    f"• *Trigger:* {signal['candle_pattern']} at Value/Liquidity\n"
+                    f"• *Trigger:* {signal['candle_pattern']}\n"
                     f"• *Entry:* `{signal['entry_price']}`\n"
                     f"• *Stop Loss:* `{signal['stop_loss']}`\n"
                     f"• *🎯 EXIT TARGET (Before Liquidity):* `{signal['take_profit_liquidity']}`\n"
@@ -251,6 +350,7 @@ def run_market_scan() -> None:
                 send_telegram(msg)
         except Exception as exc:
             print(f"Scan error on {pair}: {exc}")
+    return triggered
 
 
 scheduler = BackgroundScheduler()
@@ -264,7 +364,14 @@ def health_check():
         "service": "LIQUID CASH Engine",
         "status": "running",
         "pairs": PAIRS,
+        "quota_paused": time.time() < QUOTA_EXHAUSTED_UNTIL,
     }
+
+
+@app.post("/api/scan")
+def trigger_manual_scan():
+    signals = run_market_scan(force_refresh=True)
+    return {"scanned_pairs": len(PAIRS), "new_signals": len(signals), "signals": signals}
 
 
 @app.get("/api/chart/{pair:path}")
@@ -290,6 +397,7 @@ def get_chart_data(pair: str, interval: str = "1h"):
             "candles": candles,
             "levels": levels,
             "live_signal": signal,
+            "quota_paused": time.time() < QUOTA_EXHAUSTED_UNTIL,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -304,7 +412,7 @@ def get_signals():
             supabase.table("signals")
             .select("*")
             .order("created_at", desc=True)
-            .limit(15)
+            .limit(25)
             .execute()
         )
         return res.data or []
@@ -312,7 +420,27 @@ def get_signals():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# --- Serve Built React Frontend (supports backend/ root directory) ---
+@app.patch("/api/signals/{signal_id}")
+def update_signal_status(signal_id: str, body: SignalStatusUpdate):
+    if not supabase:
+        raise HTTPException(status_code=400, detail="Supabase is not configured")
+    allowed = {"ACTIVE", "WON", "LOST", "CLOSED"}
+    next_status = body.status.strip().upper()
+    if next_status not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {next_status}")
+    try:
+        res = (
+            supabase.table("signals")
+            .update({"status": next_status})
+            .eq("id", signal_id)
+            .execute()
+        )
+        return {"updated": True, "data": res.data}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# --- Serve Built React Frontend ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIST = next(
     (
