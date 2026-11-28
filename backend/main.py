@@ -92,17 +92,13 @@ def parse_candle_timestamp(raw_dt: Any) -> int:
     return int(datetime.fromisoformat(text).timestamp())
 
 
-def get_active_session() -> Tuple[bool, str]:
-    """Check if current UTC time is inside active London or New York liquidity sessions (Mon-Fri)."""
-    now_utc = datetime.now(timezone.utc)
-    weekday = now_utc.weekday()  # 0=Mon ... 6=Sun
-    hour = now_utc.hour
+def get_session_for_dt(dt_obj: datetime) -> Tuple[bool, str]:
+    weekday = dt_obj.weekday()  # 0=Mon ... 6=Sun
+    hour = dt_obj.hour
 
-    # Weekend market closure check (Fri 22:00 UTC -> Sun 22:00 UTC)
     if weekday == 5 or (weekday == 4 and hour >= 22) or (weekday == 6 and hour < 22):
         return False, "Weekend Market Closed"
 
-    # London (07:00-16:00 UTC) & New York (12:00-21:00 UTC)
     if 12 <= hour < 16:
         return True, "London / NY Overlap (Peak Liquidity)"
     if 7 <= hour < 12:
@@ -110,6 +106,11 @@ def get_active_session() -> Tuple[bool, str]:
     if 16 <= hour < 21:
         return True, "New York Session"
     return False, "Asian / Low-Liquidity Rollover (Filtered)"
+
+
+def get_active_session() -> Tuple[bool, str]:
+    """Check if current UTC time is inside active London or New York liquidity sessions."""
+    return get_session_for_dt(datetime.now(timezone.utc))
 
 
 def send_telegram(message: str) -> None:
@@ -143,7 +144,7 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250, force_
 
     if not force_refresh and cache_key in CANDLE_CACHE:
         cached_at, cached_df = CANDLE_CACHE[cache_key]
-        if (now - cached_at) < CACHE_TTL_SECONDS:
+        if (now - cached_at) < CACHE_TTL_SECONDS and len(cached_df) >= min(outputsize, 220):
             return cached_df.copy()
 
     if now < QUOTA_EXHAUSTED_UNTIL and cache_key in CANDLE_CACHE:
@@ -180,7 +181,12 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 250, force_
     return df
 
 
-def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
+def analyze_maee_liquidity(
+    df: pd.DataFrame,
+    pair: str,
+    timeframe: str = "1h",
+    ignore_session: bool = False,
+):
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
     pip_mult = get_pip_multiplier(symbol)
@@ -209,6 +215,17 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
     curr = work_df.iloc[-1]
     prev = work_df.iloc[-2] if len(work_df) >= 2 else curr
     atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else 0.0005
+
+    # When backtesting historical bars, check the historical candle's own session window
+    if ignore_session and "datetime" in curr:
+        try:
+            candle_ts = parse_candle_timestamp(curr["datetime"])
+            candle_dt = datetime.fromtimestamp(candle_ts, tz=timezone.utc)
+            session_allowed, session_name = get_session_for_dt(candle_dt)
+        except Exception:
+            session_allowed = True
+    else:
+        session_allowed = True if ignore_session else in_session
 
     close_price = float(curr["close"])
     open_price = float(curr["open"])
@@ -291,44 +308,54 @@ def analyze_maee_liquidity(df: pd.DataFrame, pair: str, timeframe: str = "1h"):
         exit_detail = f"{dist_bsl_pips}p to BSL · {dist_ssl_pips}p to SSL"
 
     signal: Optional[Dict[str, Any]] = None
-    if in_session and ((uptrend and near_value_bull and (bull_pin or bull_engulf)) or ssl_sweep_reclaim):
-        pattern = "SSL Liquidity Sweep + Reclaim" if ssl_sweep_reclaim else ("Bullish Engulfing" if bull_engulf else "Bullish Pin Bar")
+    if session_allowed and ((uptrend and near_value_bull and (bull_pin or bull_engulf)) or ssl_sweep_reclaim):
+        pattern = (
+            "SSL Liquidity Sweep + Reclaim"
+            if ssl_sweep_reclaim
+            else ("Bullish Engulfing" if bull_engulf else "Bullish Pin Bar")
+        )
         entry = close_price
         sl = format_price(symbol, min(low_price, ssl) - (0.5 * atr))
         tp_liquidity = format_price(symbol, bsl - (0.15 * atr))
         trailing_exit = format_price(symbol, entry - (3.0 * atr))
-        signal = {
-            "pair": symbol,
-            "timeframe": tf,
-            "direction": "BUY",
-            "market_structure": f"{session_name} · Bullish",
-            "liquidity_zone": format_price(symbol, ssl),
-            "entry_price": format_price(symbol, entry),
-            "stop_loss": sl,
-            "take_profit_liquidity": tp_liquidity,
-            "trailing_atr_exit": trailing_exit,
-            "candle_pattern": pattern,
-            "status": "ACTIVE",
-        }
-    elif in_session and ((downtrend and near_value_bear and (bear_pin or bear_engulf)) or bsl_sweep_reclaim):
-        pattern = "BSL Liquidity Sweep + Reclaim" if bsl_sweep_reclaim else ("Bearish Engulfing" if bear_engulf else "Bearish Pin Bar")
+        if tp_liquidity > entry and sl < entry:
+            signal = {
+                "pair": symbol,
+                "timeframe": tf,
+                "direction": "BUY",
+                "market_structure": f"{session_name} · Bullish",
+                "liquidity_zone": format_price(symbol, ssl),
+                "entry_price": format_price(symbol, entry),
+                "stop_loss": sl,
+                "take_profit_liquidity": tp_liquidity,
+                "trailing_atr_exit": trailing_exit,
+                "candle_pattern": pattern,
+                "status": "ACTIVE",
+            }
+    elif session_allowed and ((downtrend and near_value_bear and (bear_pin or bear_engulf)) or bsl_sweep_reclaim):
+        pattern = (
+            "BSL Liquidity Sweep + Reclaim"
+            if bsl_sweep_reclaim
+            else ("Bearish Engulfing" if bear_engulf else "Bearish Pin Bar")
+        )
         entry = close_price
         sl = format_price(symbol, max(high_price, bsl) + (0.5 * atr))
         tp_liquidity = format_price(symbol, ssl + (0.15 * atr))
         trailing_exit = format_price(symbol, entry + (3.0 * atr))
-        signal = {
-            "pair": symbol,
-            "timeframe": tf,
-            "direction": "SELL",
-            "market_structure": f"{session_name} · Bearish",
-            "liquidity_zone": format_price(symbol, bsl),
-            "entry_price": format_price(symbol, entry),
-            "stop_loss": sl,
-            "take_profit_liquidity": tp_liquidity,
-            "trailing_atr_exit": trailing_exit,
-            "candle_pattern": pattern,
-            "status": "ACTIVE",
-        }
+        if tp_liquidity < entry and sl > entry:
+            signal = {
+                "pair": symbol,
+                "timeframe": tf,
+                "direction": "SELL",
+                "market_structure": f"{session_name} · Bearish",
+                "liquidity_zone": format_price(symbol, bsl),
+                "entry_price": format_price(symbol, entry),
+                "stop_loss": sl,
+                "take_profit_liquidity": tp_liquidity,
+                "trailing_atr_exit": trailing_exit,
+                "candle_pattern": pattern,
+                "status": "ACTIVE",
+            }
 
     levels = {
         "bsl": format_price(symbol, bsl),
@@ -361,7 +388,7 @@ def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
     for pair in PAIRS:
         try:
             df = fetch_candles(pair, "1h", 250, force_refresh=force_refresh)
-            signal, _ = analyze_maee_liquidity(df, pair, "1h")
+            signal, _ = analyze_maee_liquidity(df, pair, "1h", ignore_session=False)
             if signal:
                 triggered.append(signal)
                 if supabase:
@@ -411,8 +438,8 @@ def get_chart_data(pair: str, interval: str = "1h"):
     symbol = normalize_pair(pair)
     tf = normalize_interval(interval)
     try:
-        df = fetch_candles(symbol, tf, 220)
-        signal, levels = analyze_maee_liquidity(df, symbol, tf)
+        df = fetch_candles(symbol, tf, 250)
+        signal, levels = analyze_maee_liquidity(df, symbol, tf, ignore_session=False)
         candles = [
             {
                 "time": parse_candle_timestamp(row["datetime"]),
@@ -421,7 +448,7 @@ def get_chart_data(pair: str, interval: str = "1h"):
                 "low": float(row["low"]),
                 "close": float(row["close"]),
             }
-            for _, row in df.tail(120).iterrows()
+            for _, row in df.tail(140).iterrows()
         ]
         return {
             "pair": symbol,
@@ -430,6 +457,119 @@ def get_chart_data(pair: str, interval: str = "1h"):
             "levels": levels,
             "live_signal": signal,
             "quota_paused": time.time() < QUOTA_EXHAUSTED_UNTIL,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest/{pair:path}")
+def run_historical_backtest(pair: str, interval: str = "1h", bars: int = 300):
+    """Walk historical candles to simulate past LIQUID CASH setups and calculate Win/Loss stats."""
+    symbol = normalize_pair(pair)
+    tf = normalize_interval(interval)
+    lookback_bars = max(120, min(int(bars), 500))
+
+    try:
+        df = fetch_candles(symbol, tf, lookback_bars)
+        if len(df) < 60:
+            return {"pair": symbol, "interval": tf, "trades": [], "summary": {}}
+
+        trades: List[Dict[str, Any]] = []
+        cooldown_until_idx = 0
+
+        for idx in range(45, len(df) - 2):
+            if idx < cooldown_until_idx:
+                continue
+
+            slice_df = df.iloc[: idx + 1]
+            signal, _ = analyze_maee_liquidity(slice_df, symbol, tf, ignore_session=True)
+            if not signal:
+                continue
+
+            entry = float(signal["entry_price"])
+            sl = float(signal["stop_loss"])
+            tp = float(signal["take_profit_liquidity"])
+            direction = signal["direction"]
+            entry_time = str(df.iloc[idx].get("datetime", ""))
+
+            outcome = "OPEN"
+            exit_time = ""
+            exit_price = entry
+
+            for fwd_idx in range(idx + 1, min(idx + 48, len(df))):
+                candle = df.iloc[fwd_idx]
+                hi = float(candle["high"])
+                lo = float(candle["low"])
+
+                if direction == "BUY":
+                    if lo <= sl:
+                        outcome = "LOST"
+                        exit_price = sl
+                        exit_time = str(candle.get("datetime", ""))
+                        cooldown_until_idx = fwd_idx + 1
+                        break
+                    if hi >= tp:
+                        outcome = "WON"
+                        exit_price = tp
+                        exit_time = str(candle.get("datetime", ""))
+                        cooldown_until_idx = fwd_idx + 1
+                        break
+                else:
+                    if hi >= sl:
+                        outcome = "LOST"
+                        exit_price = sl
+                        exit_time = str(candle.get("datetime", ""))
+                        cooldown_until_idx = fwd_idx + 1
+                        break
+                    if lo <= tp:
+                        outcome = "WON"
+                        exit_price = tp
+                        exit_time = str(candle.get("datetime", ""))
+                        cooldown_until_idx = fwd_idx + 1
+                        break
+
+            risk = abs(entry - sl)
+            reward = abs(tp - entry)
+            rr = round(reward / risk, 2) if risk > 0 else 0.0
+            net_r = rr if outcome == "WON" else (-1.0 if outcome == "LOST" else 0.0)
+
+            trades.append({
+                "id": f"bt-{symbol}-{idx}",
+                "pair": symbol,
+                "timeframe": tf,
+                "direction": direction,
+                "candle_pattern": signal["candle_pattern"],
+                "entry_price": signal["entry_price"],
+                "stop_loss": signal["stop_loss"],
+                "take_profit_liquidity": signal["take_profit_liquidity"],
+                "trailing_atr_exit": signal["trailing_atr_exit"],
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "exit_price": exit_price,
+                "rr": rr,
+                "net_r": net_r,
+                "status": outcome,
+            })
+
+        closed = [t for t in trades if t["status"] in ("WON", "LOST")]
+        wins = [t for t in closed if t["status"] == "WON"]
+        losses = [t for t in closed if t["status"] == "LOST"]
+        win_rate = round((len(wins) / len(closed)) * 100, 1) if closed else 0.0
+        total_r = round(sum(t["net_r"] for t in closed), 2)
+
+        return {
+            "pair": symbol,
+            "interval": tf,
+            "bars_tested": len(df),
+            "summary": {
+                "total_signals": len(trades),
+                "closed_trades": len(closed),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": win_rate,
+                "net_r": total_r,
+            },
+            "trades": list(reversed(trades)),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
