@@ -1,4 +1,3 @@
-import LiveChart from './LiveChart';
 import React, { useEffect, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
 import {
@@ -6,6 +5,7 @@ import {
   AlertTriangle,
   ArrowDownRight,
   ArrowUpRight,
+  BarChart2,
   CheckCircle2,
   Clock,
   Crosshair,
@@ -15,13 +15,15 @@ import {
   TrendingDown,
   TrendingUp,
 } from 'lucide-react';
+import LiveChart from './LiveChart';
 
-const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'XAU/USD'];
+const PAIRS = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'GBP/JPY', 'XAU/USD'];
 const TIMEFRAMES = ['15min', '1h', '4h'];
 
 export default function App() {
   const [selectedPair, setSelectedPair] = useState('EUR/USD');
   const [timeframe, setTimeframe] = useState('1h');
+  const [chartMode, setChartMode] = useState('backend'); // 'backend' | 'tradingview'
   const [chartData, setChartData] = useState(null);
   const [signals, setSignals] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -80,6 +82,7 @@ export default function App() {
   }, [selectedPair, timeframe]);
 
   useEffect(() => {
+    if (chartMode !== 'backend') return;
     if (!chartContainerRef.current || !chartData?.candles?.length) return;
 
     if (chartInstanceRef.current) {
@@ -172,7 +175,7 @@ export default function App() {
         chartInstanceRef.current = null;
       }
     };
-  }, [chartData]);
+  }, [chartData, chartMode]);
 
   const levels = chartData?.levels || {};
   const liveSig = chartData?.live_signal || {};
@@ -239,24 +242,51 @@ export default function App() {
             ))}
           </div>
 
-          <div className="flex items-center gap-1.5 bg-slate-900 p-1 rounded-lg border border-slate-800">
-            {TIMEFRAMES.map((tf) => (
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
               <button
-                key={tf}
-                onClick={() => setTimeframe(tf)}
-                className={`px-3 py-1 rounded-md text-xs font-medium transition ${
-                  timeframe === tf
-                    ? 'bg-slate-700 text-white'
+                onClick={() => setChartMode('backend')}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
+                  chartMode === 'backend'
+                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                {tf}
+                BSL/SSL Chart
               </button>
-            ))}
+              <button
+                onClick={() => setChartMode('tradingview')}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition ${
+                  chartMode === 'tradingview'
+                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Live TV Chart
+              </button>
+            </div>
+
+            {chartMode === 'backend' && (
+              <div className="flex items-center gap-1.5 bg-slate-900 p-1 rounded-lg border border-slate-800">
+                {TIMEFRAMES.map((tf) => (
+                  <button
+                    key={tf}
+                    onClick={() => setTimeframe(tf)}
+                    className={`px-3 py-1 rounded-md text-xs font-medium transition ${
+                      timeframe === tf
+                        ? 'bg-slate-700 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {tf}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
-        {error && (
+        {error && chartMode === 'backend' && (
           <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 flex items-center gap-3 text-red-300 text-sm">
             <AlertTriangle className="h-5 w-5 text-red-400 shrink-0" />
             <div>
@@ -336,29 +366,42 @@ export default function App() {
           <div className="lg:col-span-2 bg-[#0b101b] rounded-xl border border-slate-800/80 p-4">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <Layers className="h-4 w-4 text-emerald-400" />
+                {chartMode === 'backend' ? (
+                  <Layers className="h-4 w-4 text-emerald-400" />
+                ) : (
+                  <BarChart2 className="h-4 w-4 text-emerald-400" />
+                )}
                 <h2 className="text-sm font-semibold text-white">
-                  {selectedPair} Live Liquidity &amp; MAEE Chart ({timeframe})
+                  {chartMode === 'backend'
+                    ? `${selectedPair} Liquidity & MAEE Chart (${timeframe})`
+                    : `${selectedPair} Live TradingView Chart`}
                 </h2>
               </div>
-              <div className="flex items-center gap-3 text-[11px] text-slate-400">
-                <span className="flex items-center gap-1">
-                  <span className="h-2 w-2 rounded-full bg-amber-400 inline-block" /> BSL
-                </span>
-                <span className="flex items-center gap-1">
-                  <span className="h-2 w-2 rounded-full bg-sky-400 inline-block" /> SSL
-                </span>
-              </div>
-            </div>
 
-            <div className="relative w-full h-[440px]">
-              {loading && !chartData && (
-                <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-400 z-10">
-                  Loading market candles &amp; liquidity pools...
+              {chartMode === 'backend' && (
+                <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                  <span className="flex items-center gap-1">
+                    <span className="h-2 w-2 rounded-full bg-amber-400 inline-block" /> BSL
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <span className="h-2 w-2 rounded-full bg-sky-400 inline-block" /> SSL
+                  </span>
                 </div>
               )}
-              <div ref={chartContainerRef} className="w-full h-[440px]" />
             </div>
+
+            {chartMode === 'tradingview' ? (
+              <LiveChart selectedPair={selectedPair} />
+            ) : (
+              <div className="relative w-full h-[440px]">
+                {loading && !chartData && (
+                  <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-400 z-10">
+                    Loading market candles &amp; liquidity pools...
+                  </div>
+                )}
+                <div ref={chartContainerRef} className="w-full h-[440px]" />
+              </div>
+            )}
           </div>
 
           <div className="bg-[#0b101b] rounded-xl border border-slate-800/80 p-4 flex flex-col">
