@@ -14,6 +14,7 @@ import {
   Copy,
   Check,
   Eye,
+  History,
 } from 'lucide-react';
 import LiveChart from './LiveChart';
 
@@ -32,6 +33,12 @@ export default function App() {
   const [inspectedSignal, setInspectedSignal] = useState(null);
   const [signals, setSignals] = useState([]);
   const [filterByPair, setFilterByPair] = useState(false);
+
+  // Historical Backtest State
+  const [backtesting, setBacktesting] = useState(false);
+  const [backtestBars, setBacktestBars] = useState(300);
+  const [backtestResult, setBacktestResult] = useState(null);
+  const [activeLogTab, setActiveLogTab] = useState('live'); // 'live' | 'backtest'
 
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -72,7 +79,7 @@ export default function App() {
       setLiveSignal(data.live_signal || null);
       if (data.live_signal) {
         setInspectedSignal(data.live_signal);
-        setChartMode('bsl'); // Auto-display TradingView-style Position Overlay when a live setup fires
+        setChartMode('bsl');
       }
       setQuotaNotice(
         data.quota_paused
@@ -97,7 +104,6 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [fetchMarketMetrics, fetchSignals]);
 
-  // Select the most recent logged signal for this pair if no live signal is currently pinned
   const activeOverlaySignal =
     inspectedSignal && inspectedSignal.pair === selectedPair
       ? inspectedSignal
@@ -135,7 +141,6 @@ export default function App() {
 
     candleSeries.setData(candles);
 
-    // Draw BSL & SSL Liquidity Lines
     if (levels?.bsl) {
       candleSeries.createPriceLine({
         price: Number(levels.bsl),
@@ -157,7 +162,6 @@ export default function App() {
       });
     }
 
-    // Draw TradingView-Style Long/Short Position Overlay (Shaded TP & SL Zones + 3x ATR Trail)
     if (activeOverlaySignal) {
       const entry = Number(activeOverlaySignal.entry_price);
       const sl = Number(activeOverlaySignal.stop_loss);
@@ -165,7 +169,6 @@ export default function App() {
       const trail = Number(activeOverlaySignal.trailing_atr_exit);
       const isBuy = activeOverlaySignal.direction === 'BUY';
 
-      // Shade the right-most 25 candles like TradingView's Long/Short Position Tool
       const zoneCandles = candles.slice(-25);
 
       const tpZoneSeries = chart.addBaselineSeries({
@@ -199,7 +202,6 @@ export default function App() {
         slZoneSeries.setData(zoneCandles.map((c) => ({ time: c.time, value: sl })));
       }
 
-      // Crisp Price Lines for Entry, Stop Loss, Exit TP, and 3x ATR Trail
       if (!Number.isNaN(tp)) {
         candleSeries.createPriceLine({
           price: tp,
@@ -266,6 +268,27 @@ export default function App() {
     }
   };
 
+  const handleRunBacktest = async (barsOverride) => {
+    const barsToTest = barsOverride || backtestBars;
+    setBacktesting(true);
+    setActiveLogTab('backtest');
+    try {
+      const encodedPair = encodeURIComponent(selectedPair);
+      const res = await fetch(
+        `${API_BASE}/api/backtest/${encodedPair}?interval=${interval}&bars=${barsToTest}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setBacktestResult(data);
+        if (data.trades && data.trades.length > 0) {
+          setInspectedSignal(data.trades[0]);
+        }
+      }
+    } finally {
+      setBacktesting(false);
+    }
+  };
+
   const handleUpdateSignal = async (id, status) => {
     if (!id) return;
     try {
@@ -308,7 +331,6 @@ export default function App() {
   const wonTrades = signals.filter((s) => s.status === 'WON').length;
   const winRate = closedTrades.length > 0 ? Math.round((wonTrades / closedTrades.length) * 100) : null;
 
-  // Calculate Risk:Reward ratio for the active overlay signal
   const calcRR = (sig) => {
     if (!sig) return null;
     const risk = Math.abs(Number(sig.entry_price) - Number(sig.stop_loss));
@@ -354,6 +376,14 @@ export default function App() {
             {lastUpdated && (
               <span className="text-xs text-slate-400">Updated {lastUpdated}</span>
             )}
+            <button
+              onClick={() => handleRunBacktest(backtestBars)}
+              disabled={backtesting}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white transition disabled:opacity-50"
+            >
+              <History className={`w-3.5 h-3.5 ${backtesting ? 'animate-spin' : ''}`} />
+              {backtesting ? 'Backtesting...' : `Backtest ${selectedPair}`}
+            </button>
             <button
               onClick={handleManualScan}
               disabled={scanning}
@@ -505,7 +535,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Active Setup Banner with Copy-Trade Levels */}
+        {/* Active / Inspected Setup Banner with Copy-Trade Levels */}
         {activeOverlaySignal && (
           <div className="bg-emerald-500/10 border border-emerald-500/40 rounded-2xl p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
             <div className="flex items-start gap-3">
@@ -518,6 +548,11 @@ export default function App() {
                   {calcRR(activeOverlaySignal) && (
                     <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
                       {calcRR(activeOverlaySignal)}R Target
+                    </span>
+                  )}
+                  {activeOverlaySignal.entry_time && (
+                    <span className="text-[11px] text-slate-400">
+                      ({activeOverlaySignal.entry_time})
                     </span>
                   )}
                 </div>
@@ -602,120 +637,270 @@ export default function App() {
           )}
         </div>
 
-        {/* Supabase Signals & Copy-Trade Log */}
+        {/* Bottom Panel: Live Signals vs. Historical Backtest Results */}
         <div className="bg-[#0d1526] border border-slate-800/90 rounded-2xl p-4">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-            <div className="flex items-center gap-2.5">
-              <h3 className="text-sm font-semibold text-white">Recent Liquidity &amp; Exit Signals</h3>
-              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">
-                {visibleSignals.length} logged
-              </span>
-              {winRate !== null && (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => setActiveLogTab('live')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition border ${
+                  activeLogTab === 'live'
+                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                    : 'bg-slate-800/70 text-slate-400 border-slate-700 hover:text-white'
+                }`}
+              >
+                Live Logged Signals ({visibleSignals.length})
+              </button>
+              <button
+                onClick={() => setActiveLogTab('backtest')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition border ${
+                  activeLogTab === 'backtest'
+                    ? 'bg-purple-500/20 text-purple-300 border-purple-500/40'
+                    : 'bg-slate-800/70 text-slate-400 border-slate-700 hover:text-white'
+                }`}
+              >
+                Historical Backtest ({backtestResult?.trades?.length ?? 0})
+              </button>
+              {winRate !== null && activeLogTab === 'live' && (
                 <span className="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-semibold">
-                  Win Rate: {winRate}% ({wonTrades}/{closedTrades.length})
+                  Live Win Rate: {winRate}% ({wonTrades}/{closedTrades.length})
                 </span>
               )}
             </div>
 
-            <button
-              onClick={() => setFilterByPair((prev) => !prev)}
-              className={`text-xs px-3 py-1 rounded-lg border transition ${
-                filterByPair
-                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
-                  : 'bg-slate-800/70 text-slate-300 border-slate-700 hover:text-white'
-              }`}
-            >
-              {filterByPair ? `Showing ${selectedPair} Only` : 'Filter by Selected Pair'}
-            </button>
+            {activeLogTab === 'live' ? (
+              <button
+                onClick={() => setFilterByPair((prev) => !prev)}
+                className={`text-xs px-3 py-1 rounded-lg border transition ${
+                  filterByPair
+                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                    : 'bg-slate-800/70 text-slate-300 border-slate-700 hover:text-white'
+                }`}
+              >
+                {filterByPair ? `Showing ${selectedPair} Only` : 'Filter by Selected Pair'}
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                {[250, 450].map((bars) => (
+                  <button
+                    key={bars}
+                    onClick={() => {
+                      setBacktestBars(bars);
+                      handleRunBacktest(bars);
+                    }}
+                    className={`text-xs px-2.5 py-1 rounded-lg border transition ${
+                      backtestBars === bars
+                        ? 'bg-purple-500/20 text-purple-300 border-purple-500/40'
+                        : 'bg-slate-800 text-slate-300 border-slate-700'
+                    }`}
+                  >
+                    {bars === 250 ? '~2 Weeks (250 bars)' : '~1 Month (450 bars)'}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          {visibleSignals.length === 0 ? (
-            <p className="text-xs text-slate-400 py-4 text-center">
-              No signals logged yet. The backend scheduler scans every 15 minutes during London &amp; NY sessions (or click{' '}
-              <span className="text-emerald-400 font-medium">Scan All Pairs</span> above) for BSL/SSL sweeps and MAEE exit triggers.
-            </p>
-          ) : (
-            <div className="space-y-2.5">
-              {visibleSignals.map((sig, idx) => {
-                const sigKey = sig.id || idx;
-                return (
-                  <div
-                    key={sigKey}
-                    className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 p-3 rounded-xl bg-[#070d19] border border-slate-800/80"
-                  >
-                    <div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-xs font-bold text-white">{sig.pair}</span>
-                        <span
-                          className={`text-[11px] font-bold px-2 py-0.5 rounded ${
-                            sig.direction === 'BUY'
-                              ? 'bg-emerald-500/20 text-emerald-400'
-                              : 'bg-rose-500/20 text-rose-400'
-                          }`}
+          {activeLogTab === 'live' ? (
+            visibleSignals.length === 0 ? (
+              <p className="text-xs text-slate-400 py-4 text-center">
+                No live signals logged yet. Click{' '}
+                <button
+                  onClick={() => handleRunBacktest(backtestBars)}
+                  className="text-purple-400 underline font-medium"
+                >
+                  Backtest {selectedPair}
+                </button>{' '}
+                to see how this strategy performed over previous weeks right now.
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {visibleSignals.map((sig, idx) => {
+                  const sigKey = sig.id || idx;
+                  return (
+                    <div
+                      key={sigKey}
+                      className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 p-3 rounded-xl bg-[#070d19] border border-slate-800/80"
+                    >
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-bold text-white">{sig.pair}</span>
+                          <span
+                            className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                              sig.direction === 'BUY'
+                                ? 'bg-emerald-500/20 text-emerald-400'
+                                : 'bg-rose-500/20 text-rose-400'
+                            }`}
+                          >
+                            {sig.direction}
+                          </span>
+                          <span className="text-xs text-slate-300">{sig.candle_pattern}</span>
+                          <span className="text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                            {sig.status || 'ACTIVE'}
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-400 mt-1">
+                          Entry: <span className="text-slate-200 font-mono">{sig.entry_price}</span> · SL:{' '}
+                          <span className="text-rose-400 font-mono">{sig.stop_loss}</span> · Exit TP:{' '}
+                          <span className="text-emerald-400 font-mono">{sig.take_profit_liquidity}</span> · 3x ATR Trail:{' '}
+                          <span className="text-cyan-300 font-mono">{sig.trailing_atr_exit}</span>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => handleVisualizeSignal(sig)}
+                          className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30"
                         >
-                          {sig.direction}
-                        </span>
-                        <span className="text-xs text-slate-300">{sig.candle_pattern}</span>
-                        <span className="text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
-                          {sig.status || 'ACTIVE'}
-                        </span>
-                      </div>
-                      <div className="text-xs text-slate-400 mt-1">
-                        Entry: <span className="text-slate-200 font-mono">{sig.entry_price}</span> · SL:{' '}
-                        <span className="text-rose-400 font-mono">{sig.stop_loss}</span> · Exit TP:{' '}
-                        <span className="text-emerald-400 font-mono">{sig.take_profit_liquidity}</span> · 3x ATR Trail:{' '}
-                        <span className="text-cyan-300 font-mono">{sig.trailing_atr_exit}</span>
-                      </div>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2 shrink-0">
-                      <button
-                        onClick={() => handleVisualizeSignal(sig)}
-                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30"
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                        Plot on Chart
-                      </button>
-
-                      <button
-                        onClick={() => handleCopyLevels(sig, sigKey)}
-                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
-                      >
-                        {copiedId === sigKey ? (
+                          <Eye className="w-3.5 h-3.5" />
+                          Plot on Chart
+                        </button>
+                        <button
+                          onClick={() => handleCopyLevels(sig, sigKey)}
+                          className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                        >
+                          {copiedId === sigKey ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              Copied
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              Copy Levels
+                            </>
+                          )}
+                        </button>
+                        {sig.id && sig.status === 'ACTIVE' && (
                           <>
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                            Copied
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            Copy Levels
+                            <button
+                              onClick={() => handleUpdateSignal(sig.id, 'WON')}
+                              className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              Won
+                            </button>
+                            <button
+                              onClick={() => handleUpdateSignal(sig.id, 'LOST')}
+                              className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 border border-rose-500/30"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                              Lost
+                            </button>
                           </>
                         )}
-                      </button>
-
-                      {sig.id && sig.status === 'ACTIVE' && (
-                        <>
-                          <button
-                            onClick={() => handleUpdateSignal(sig.id, 'WON')}
-                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30"
-                          >
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            Won
-                          </button>
-                          <button
-                            onClick={() => handleUpdateSignal(sig.id, 'LOST')}
-                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 border border-rose-500/30"
-                          >
-                            <XCircle className="w-3.5 h-3.5" />
-                            Lost
-                          </button>
-                        </>
-                      )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )
+          ) : (
+            <div className="space-y-4">
+              {!backtestResult ? (
+                <div className="text-center py-6 space-y-3">
+                  <p className="text-xs text-slate-400">
+                    Run a historical simulation on <strong>{selectedPair} ({interval})</strong> to see every signal that would have fired over the past weeks and whether TP or SL hit first.
+                  </p>
+                  <button
+                    onClick={() => handleRunBacktest(backtestBars)}
+                    disabled={backtesting}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white"
+                  >
+                    <History className="w-4 h-4" />
+                    {backtesting ? 'Simulating Candles...' : `Run ${selectedPair} Historical Backtest`}
+                  </button>
+                </div>
+              ) : (
+                <>
+                  {/* Backtest Scoreboard */}
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 bg-[#070d19] border border-purple-500/30 rounded-xl p-3">
+                    <div>
+                      <div className="text-[11px] text-slate-400 uppercase">Closed Trades</div>
+                      <div className="text-lg font-bold text-white">{backtestResult.summary?.closed_trades ?? 0}</div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-400 uppercase">Wins</div>
+                      <div className="text-lg font-bold text-emerald-400">{backtestResult.summary?.wins ?? 0}</div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-400 uppercase">Losses</div>
+                      <div className="text-lg font-bold text-rose-400">{backtestResult.summary?.losses ?? 0}</div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-400 uppercase">Win Rate</div>
+                      <div className="text-lg font-bold text-amber-300">{backtestResult.summary?.win_rate ?? 0}%</div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-400 uppercase">Net Return</div>
+                      <div
+                        className={`text-lg font-bold ${
+                          (backtestResult.summary?.net_r ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                        }`}
+                      >
+                        {(backtestResult.summary?.net_r ?? 0) >= 0 ? '+' : ''}
+                        {backtestResult.summary?.net_r ?? 0}R
+                      </div>
                     </div>
                   </div>
-                );
-              })}
+
+                  {/* Individual Backtested Trades */}
+                  {backtestResult.trades?.length === 0 ? (
+                    <p className="text-xs text-slate-400 text-center py-3">
+                      No setups triggered on {selectedPair} ({interval}) in this window. Try switching to <strong>1h</strong> or <strong>4h</strong> and running the backtest again.
+                    </p>
+                  ) : (
+                    <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
+                      {backtestResult.trades.map((bt) => (
+                        <div
+                          key={bt.id}
+                          className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 p-3 rounded-xl bg-[#070d19] border border-slate-800/80"
+                        >
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs font-bold text-white">{bt.pair}</span>
+                              <span
+                                className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                                  bt.direction === 'BUY'
+                                    ? 'bg-emerald-500/20 text-emerald-400'
+                                    : 'bg-rose-500/20 text-rose-400'
+                                }`}
+                              >
+                                {bt.direction}
+                              </span>
+                              <span className="text-xs text-slate-300">{bt.candle_pattern}</span>
+                              <span
+                                className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                                  bt.status === 'WON'
+                                    ? 'bg-emerald-500/20 text-emerald-300'
+                                    : bt.status === 'LOST'
+                                    ? 'bg-rose-500/20 text-rose-300'
+                                    : 'bg-slate-800 text-slate-300'
+                                }`}
+                              >
+                                {bt.status} ({bt.net_r >= 0 ? `+${bt.net_r}R` : `${bt.net_r}R`})
+                              </span>
+                            </div>
+                            <div className="text-xs text-slate-400 mt-1">
+                              {bt.entry_time} · Entry: <span className="text-slate-200 font-mono">{bt.entry_price}</span> · SL:{' '}
+                              <span className="text-rose-400 font-mono">{bt.stop_loss}</span> · Exit TP:{' '}
+                              <span className="text-emerald-400 font-mono">{bt.take_profit_liquidity}</span>
+                            </div>
+                          </div>
+
+                          <button
+                            onClick={() => handleVisualizeSignal(bt)}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 shrink-0"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            Plot on Chart
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           )}
         </div>
