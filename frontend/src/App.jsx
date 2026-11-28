@@ -1,3 +1,4 @@
+import LiveChart from './LiveChart';
 import React, { useEffect, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
 import {
