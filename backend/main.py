@@ -147,7 +147,7 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 500, force_
     if now < QUOTA_EXHAUSTED_UNTIL and cache_key in CANDLE_CACHE:
         return CANDLE_CACHE[cache_key][1].copy()
 
-    size = max(120, min(int(outputsize), 500))
+    size = max(160, min(int(outputsize), 500))
     response = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -178,58 +178,60 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 500, force_
     return df
 
 
-def get_major_liquidity_pools(
+def find_untouched_major_pools(
     df: pd.DataFrame,
     window_bars: int = 150,
-    left_right: int = 4,
-) -> Tuple[float, float]:
+    left_right: int = 5,
+) -> Tuple[float, int, float, int]:
     """
-    Finds major Buy-Side Liquidity (BSL) and Sell-Side Liquidity (SSL) using
-    confirmed swing-pivot highs and lows over a 150-bar institutional lookback.
-    Falls back to extreme window highs/lows if no strict pivot exists.
+    Finds the highest confirmed swing-pivot high (BSL) and lowest confirmed
+    swing-pivot low (SSL) over a 150-bar window (requiring 5 bars on each side).
     """
     n = len(df)
-    if n == 0:
-        return 0.0, 0.0
-
-    start_idx = max(0, n - window_bars)
-    end_idx = max(start_idx + 1, n - (left_right + 1))
+    start_idx = max(left_right, n - window_bars)
+    end_idx = max(start_idx + 1, n - (left_right + 2))
 
     highs = df["high"].to_numpy(dtype=float)
     lows = df["low"].to_numpy(dtype=float)
 
-    swing_highs: List[float] = []
-    swing_lows: List[float] = []
+    best_bsl = -1.0
+    best_bsl_idx = -1
+    best_ssl = float("inf")
+    best_ssl_idx = -1
 
-    for i in range(max(start_idx, left_right), end_idx):
+    for i in range(start_idx, end_idx):
         h_val = highs[i]
         l_val = lows[i]
 
         left_h = highs[i - left_right : i]
         right_h = highs[i + 1 : i + 1 + left_right]
-        if len(left_h) > 0 and len(right_h) > 0:
+        if len(left_h) == left_right and len(right_h) == left_right:
             if h_val > float(left_h.max()) and h_val >= float(right_h.max()):
-                swing_highs.append(h_val)
+                if h_val >= best_bsl:
+                    best_bsl = h_val
+                    best_bsl_idx = i
 
         left_l = lows[i - left_right : i]
         right_l = lows[i + 1 : i + 1 + left_right]
-        if len(left_l) > 0 and len(right_l) > 0:
+        if len(left_l) == left_right and len(right_l) == left_right:
             if l_val < float(left_l.min()) and l_val <= float(right_l.min()):
-                swing_lows.append(l_val)
+                if l_val <= best_ssl:
+                    best_ssl = l_val
+                    best_ssl_idx = i
 
-    # Major BSL = highest confirmed swing high in the 150-bar window
-    # Major SSL = lowest confirmed swing low in the 150-bar window
-    if swing_highs:
-        bsl = max(swing_highs)
-    else:
-        bsl = float(highs[start_idx : max(start_idx + 1, n - 4)].max())
+    if best_bsl_idx == -1:
+        sub_h = highs[start_idx:end_idx]
+        rel = int(sub_h.argmax())
+        best_bsl_idx = start_idx + rel
+        best_bsl = float(highs[best_bsl_idx])
 
-    if swing_lows:
-        ssl = min(swing_lows)
-    else:
-        ssl = float(lows[start_idx : max(start_idx + 1, n - 4)].min())
+    if best_ssl_idx == -1:
+        sub_l = lows[start_idx:end_idx]
+        rel = int(sub_l.argmin())
+        best_ssl_idx = start_idx + rel
+        best_ssl = float(lows[best_ssl_idx])
 
-    return bsl, ssl
+    return best_bsl, best_bsl_idx, best_ssl, best_ssl_idx
 
 
 def analyze_maee_liquidity(
@@ -239,11 +241,12 @@ def analyze_maee_liquidity(
     ignore_session: bool = False,
 ):
     """
-    MAEE & Major Liquidity Strategy (Strict 1:3 R:R):
-    - Anchors BSL and SSL to confirmed swing-pivot highs and lows over 150 bars
-    - Only labels a sweep when price pierces >= 0.30 ATR past a confirmed 150-bar
-      major liquidity level (preventing false mid-range breakout labels)
-    - Aligns with trend/continuation and enforces strict 1:3 Take Profit
+    Strict 2-Candle Confirmed Major Liquidity Sweep Continuation (1:3 R:R):
+    - Anchors BSL/SSL to untouched 150-bar confirmed 5-bar swing pivots
+    - Candle 1 (prev) breaks and closes beyond the untouched BSL/SSL pool
+    - Candle 2 (curr) holds beyond the swept level and closes strongly in the
+      continuation direction (filtering out 1-candle fakeouts like GBP/JPY 209.51)
+    - Enforces strict 1:3 Take Profit = Entry +/- (3 * Risk)
     """
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
@@ -251,9 +254,6 @@ def analyze_maee_liquidity(
     in_session, session_name = get_active_session()
 
     work_df = df.copy()
-    work_df["ema200"] = work_df["close"].ewm(span=200, adjust=False).mean()
-    work_df["ema50"] = work_df["close"].ewm(span=50, adjust=False).mean()
-
     prev_close = work_df["close"].shift(1).bfill()
     tr = pd.concat(
         [
@@ -265,11 +265,11 @@ def analyze_maee_liquidity(
     ).max(axis=1)
     work_df["atr"] = tr.rolling(14).mean()
 
-    bsl, ssl = get_major_liquidity_pools(work_df, window_bars=150, left_right=4)
+    bsl, bsl_idx, ssl, ssl_idx = find_untouched_major_pools(work_df, window_bars=150, left_right=5)
 
+    n = len(work_df)
     curr = work_df.iloc[-1]
-    prev = work_df.iloc[-2] if len(work_df) >= 2 else curr
-    recent_3 = work_df.iloc[-4:-1] if len(work_df) >= 4 else work_df.iloc[:-1]
+    prev = work_df.iloc[-2]
     atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else 0.0005
 
     if ignore_session and "datetime" in curr:
@@ -286,38 +286,48 @@ def analyze_maee_liquidity(
     open_price = float(curr["open"])
     high_price = float(curr["high"])
     low_price = float(curr["low"])
-    ema50_val = float(curr["ema50"])
-    ema200_val = float(curr["ema200"])
 
-    # True major sweep: recent highs/lows must pierce >= 0.30 ATR beyond the 150-bar confirmed pivot
-    sweep_margin = 0.30 * atr
-    major_bsl_taken_bull = (
-        float(recent_3["high"].max()) >= (bsl + sweep_margin)
-        and close_price > bsl
-        and close_price > open_price
-    )
-    major_ssl_taken_bear = (
-        float(recent_3["low"].min()) <= (ssl - sweep_margin)
-        and close_price < ssl
-        and close_price < open_price
-    )
+    prev_c = float(prev["close"])
+    prev_o = float(prev["open"])
+    prev_h = float(prev["high"])
+    prev_l = float(prev["low"])
 
     body = abs(close_price - open_price)
     candle_range = max(high_price - low_price, 1e-9)
-    strong_bull_candle = (close_price > open_price) and (body >= 0.4 * candle_range)
-    strong_bear_candle = (close_price < open_price) and (body >= 0.4 * candle_range)
+    sweep_margin = 0.25 * atr
 
-    bull_trend_cont = (
-        (close_price > ema200_val)
-        and (ema50_val > ema200_val)
-        and strong_bull_candle
-        and (abs(low_price - ema50_val) <= 0.7 * atr)
+    # BSL must have been completely untouched from bsl_idx+1 up to bar n-3
+    prior_before_break_bsl = work_df.iloc[bsl_idx + 1 : n - 2]
+    bsl_was_fresh = (
+        len(prior_before_break_bsl) >= 3 and float(prior_before_break_bsl["high"].max()) <= bsl
     )
-    bear_trend_cont = (
-        (close_price < ema200_val)
-        and (ema50_val < ema200_val)
-        and strong_bear_candle
-        and (abs(high_price - ema50_val) <= 0.7 * atr)
+    # Candle 1 (prev) swept & closed above BSL; Candle 2 (curr) held above BSL & closed higher
+    confirmed_bsl_continuation = (
+        bsl_was_fresh
+        and (prev_h >= bsl + sweep_margin)
+        and (prev_c > bsl)
+        and (prev_c > prev_o)
+        and (low_price >= bsl - 0.15 * atr)
+        and (close_price > prev_c)
+        and (close_price > open_price)
+        and (body >= 0.40 * candle_range)
+    )
+
+    # SSL must have been completely untouched from ssl_idx+1 up to bar n-3
+    prior_before_break_ssl = work_df.iloc[ssl_idx + 1 : n - 2]
+    ssl_was_fresh = (
+        len(prior_before_break_ssl) >= 3 and float(prior_before_break_ssl["low"].min()) >= ssl
+    )
+    # Candle 1 (prev) swept & closed below SSL; Candle 2 (curr) held below SSL & closed lower
+    confirmed_ssl_continuation = (
+        ssl_was_fresh
+        and (prev_l <= ssl - sweep_margin)
+        and (prev_c < ssl)
+        and (prev_c < prev_o)
+        and (high_price <= ssl + 0.15 * atr)
+        and (close_price < prev_c)
+        and (close_price < open_price)
+        and (body >= 0.40 * candle_range)
     )
 
     recent_window = work_df.iloc[-12:]
@@ -336,49 +346,43 @@ def analyze_maee_liquidity(
     signal: Optional[Dict[str, Any]] = None
     sl_buffer = 0.75 * atr
 
-    if session_allowed and (major_bsl_taken_bull or bull_trend_cont):
-        setup_label = "Major BSL Sweep Continuation" if major_bsl_taken_bull else "Bullish Trend Continuation"
+    if session_allowed and confirmed_bsl_continuation:
         entry = close_price
-        sl_anchor = bsl if major_bsl_taken_bull else min(low_price, float(prev["low"]))
-        sl_raw = sl_anchor - sl_buffer
+        sl_raw = min(low_price, bsl) - sl_buffer
         risk = entry - sl_raw
-
         if (0.75 * atr) <= risk <= (2.5 * atr):
             tp_raw = entry + (3.0 * risk)
             signal = {
                 "pair": symbol,
                 "timeframe": tf,
                 "direction": "BUY",
-                "market_structure": f"{session_name} · {setup_label}",
-                "liquidity_zone": format_price(symbol, bsl if major_bsl_taken_bull else ssl),
+                "market_structure": f"{session_name} · Confirmed BSL Sweep (1:3)",
+                "liquidity_zone": format_price(symbol, bsl),
                 "entry_price": format_price(symbol, entry),
                 "stop_loss": format_price(symbol, sl_raw),
                 "take_profit_liquidity": format_price(symbol, tp_raw),
                 "trailing_atr_exit": format_price(symbol, entry + risk),
-                "candle_pattern": setup_label,
+                "candle_pattern": "Confirmed Major BSL Sweep",
                 "status": "ACTIVE",
             }
 
-    elif session_allowed and (major_ssl_taken_bear or bear_trend_cont):
-        setup_label = "Major SSL Sweep Continuation" if major_ssl_taken_bear else "Bearish Trend Continuation"
+    elif session_allowed and confirmed_ssl_continuation:
         entry = close_price
-        sl_anchor = ssl if major_ssl_taken_bear else max(high_price, float(prev["high"]))
-        sl_raw = sl_anchor + sl_buffer
+        sl_raw = max(high_price, ssl) + sl_buffer
         risk = sl_raw - entry
-
         if (0.75 * atr) <= risk <= (2.5 * atr):
             tp_raw = entry - (3.0 * risk)
             signal = {
                 "pair": symbol,
                 "timeframe": tf,
                 "direction": "SELL",
-                "market_structure": f"{session_name} · {setup_label}",
-                "liquidity_zone": format_price(symbol, ssl if major_ssl_taken_bear else bsl),
+                "market_structure": f"{session_name} · Confirmed SSL Sweep (1:3)",
+                "liquidity_zone": format_price(symbol, ssl),
                 "entry_price": format_price(symbol, entry),
                 "stop_loss": format_price(symbol, sl_raw),
                 "take_profit_liquidity": format_price(symbol, tp_raw),
                 "trailing_atr_exit": format_price(symbol, entry - risk),
-                "candle_pattern": setup_label,
+                "candle_pattern": "Confirmed Major SSL Sweep",
                 "status": "ACTIVE",
             }
 
@@ -399,16 +403,16 @@ def analyze_maee_liquidity(
 def simulate_pair_backtest(pair: str, interval: str = "1h", bars: int = 500) -> Dict[str, Any]:
     symbol = normalize_pair(pair)
     tf = normalize_interval(interval)
-    lookback_bars = max(160, min(int(bars), 500))
+    lookback_bars = max(170, min(int(bars), 500))
 
     df = fetch_candles(symbol, tf, lookback_bars)
-    if len(df) < 155:
+    if len(df) < 160:
         return {"pair": symbol, "interval": tf, "bars_tested": len(df), "trades": [], "summary": {}}
 
     trades: List[Dict[str, Any]] = []
     cooldown_until_idx = 0
 
-    for idx in range(150, len(df) - 2):
+    for idx in range(155, len(df) - 2):
         if idx < cooldown_until_idx:
             continue
 
@@ -526,6 +530,7 @@ def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
                 msg = (
                     f"💧 *LIQUID CASH (1:3 R:R) — {signal['pair']} ({signal['direction']})*\n"
                     f"• *Setup:* {signal['candle_pattern']}\n"
+                    f"• *Swept Pool:* `{signal['liquidity_zone']}`\n"
                     f"• *Entry:* `{signal['entry_price']}`\n"
                     f"• *Stop Loss:* `{signal['stop_loss']}`\n"
                     f"• *Take Profit (1:3):* `{signal['take_profit_liquidity']}`"
