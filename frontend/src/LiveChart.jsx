@@ -15,7 +15,6 @@ export default function LiveChart({ selectedPair = 'EUR/USD' }) {
     const container = containerRef.current;
     if (!container) return;
 
-    // Clear previous chart when switching pairs
     container.innerHTML = '';
 
     const script = document.createElement('script');
