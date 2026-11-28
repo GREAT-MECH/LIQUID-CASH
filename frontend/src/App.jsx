@@ -11,6 +11,9 @@ import {
   CheckCircle2,
   XCircle,
   Radio,
+  Copy,
+  Check,
+  Eye,
 } from 'lucide-react';
 import LiveChart from './LiveChart';
 
@@ -21,12 +24,12 @@ const TIMEFRAMES = ['15min', '1h', '4h'];
 export default function App() {
   const [selectedPair, setSelectedPair] = useState('EUR/USD');
   const [interval, setIntervalValue] = useState('1h');
-  // Live TV Chart is the strict default so Twelve Data exhaustion never blocks viewing
   const [chartMode, setChartMode] = useState('tv');
 
   const [candles, setCandles] = useState([]);
   const [levels, setLevels] = useState(null);
   const [liveSignal, setLiveSignal] = useState(null);
+  const [inspectedSignal, setInspectedSignal] = useState(null);
   const [signals, setSignals] = useState([]);
   const [filterByPair, setFilterByPair] = useState(false);
 
@@ -34,6 +37,7 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [quotaNotice, setQuotaNotice] = useState('');
   const [lastUpdated, setLastUpdated] = useState('');
+  const [copiedId, setCopiedId] = useState(null);
 
   const chartContainerRef = useRef(null);
 
@@ -45,7 +49,7 @@ export default function App() {
         setSignals(Array.isArray(data) ? data : []);
       }
     } catch {
-      // Keep existing signals if network blips
+      // Keep existing signals on transient network error
     }
   }, []);
 
@@ -66,6 +70,10 @@ export default function App() {
       setCandles(data.candles || []);
       setLevels(data.levels || null);
       setLiveSignal(data.live_signal || null);
+      if (data.live_signal) {
+        setInspectedSignal(data.live_signal);
+        setChartMode('bsl'); // Auto-display TradingView-style Position Overlay when a live setup fires
+      }
       setQuotaNotice(
         data.quota_paused
           ? 'Twelve Data rate-limit cooldown active (using cached liquidity levels).'
@@ -82,7 +90,6 @@ export default function App() {
   useEffect(() => {
     fetchMarketMetrics();
     fetchSignals();
-    // Poll every 5 minutes (backend caches for 10 min, protecting 800/day Twelve Data cap)
     const timer = window.setInterval(() => {
       fetchMarketMetrics();
       fetchSignals();
@@ -90,7 +97,13 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [fetchMarketMetrics, fetchSignals]);
 
-  // Render Lightweight BSL/SSL Chart only when switched to 'bsl' mode
+  // Select the most recent logged signal for this pair if no live signal is currently pinned
+  const activeOverlaySignal =
+    inspectedSignal && inspectedSignal.pair === selectedPair
+      ? inspectedSignal
+      : liveSignal || signals.find((s) => s.pair === selectedPair) || null;
+
+  // Render TradingView-Style Long/Short Position Tool + BSL/SSL Chart
   useEffect(() => {
     if (chartMode !== 'bsl' || !chartContainerRef.current || candles.length === 0) return;
 
@@ -107,11 +120,12 @@ export default function App() {
         horzLines: { color: '#1e293b' },
       },
       width: container.clientWidth,
-      height: 450,
+      height: 460,
       timeScale: { timeVisible: true, secondsVisible: false },
+      rightPriceScale: { borderColor: '#1e293b' },
     });
 
-    const series = chart.addCandlestickSeries({
+    const candleSeries = chart.addCandlestickSeries({
       upColor: '#10b981',
       downColor: '#ef4444',
       borderVisible: false,
@@ -119,27 +133,113 @@ export default function App() {
       wickDownColor: '#ef4444',
     });
 
-    series.setData(candles);
+    candleSeries.setData(candles);
 
+    // Draw BSL & SSL Liquidity Lines
     if (levels?.bsl) {
-      series.createPriceLine({
+      candleSeries.createPriceLine({
         price: Number(levels.bsl),
         color: '#f59e0b',
-        lineWidth: 2,
+        lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,
-        title: 'BSL (Buy-Side Liquidity)',
+        title: 'BSL',
       });
     }
     if (levels?.ssl) {
-      series.createPriceLine({
+      candleSeries.createPriceLine({
         price: Number(levels.ssl),
         color: '#38bdf8',
-        lineWidth: 2,
+        lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,
-        title: 'SSL (Sell-Side Liquidity)',
+        title: 'SSL',
       });
+    }
+
+    // Draw TradingView-Style Long/Short Position Overlay (Shaded TP & SL Zones + 3x ATR Trail)
+    if (activeOverlaySignal) {
+      const entry = Number(activeOverlaySignal.entry_price);
+      const sl = Number(activeOverlaySignal.stop_loss);
+      const tp = Number(activeOverlaySignal.take_profit_liquidity);
+      const trail = Number(activeOverlaySignal.trailing_atr_exit);
+      const isBuy = activeOverlaySignal.direction === 'BUY';
+
+      // Shade the right-most 25 candles like TradingView's Long/Short Position Tool
+      const zoneCandles = candles.slice(-25);
+
+      const tpZoneSeries = chart.addBaselineSeries({
+        baseValue: { type: 'price', price: entry },
+        topFillColor1: isBuy ? 'rgba(16, 185, 129, 0.26)' : 'rgba(239, 68, 68, 0.24)',
+        topFillColor2: isBuy ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.06)',
+        bottomFillColor1: isBuy ? 'rgba(239, 68, 68, 0.06)' : 'rgba(16, 185, 129, 0.08)',
+        bottomFillColor2: isBuy ? 'rgba(239, 68, 68, 0.24)' : 'rgba(16, 185, 129, 0.26)',
+        topLineColor: 'transparent',
+        bottomLineColor: 'transparent',
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+
+      const slZoneSeries = chart.addBaselineSeries({
+        baseValue: { type: 'price', price: entry },
+        topFillColor1: isBuy ? 'rgba(16, 185, 129, 0.26)' : 'rgba(239, 68, 68, 0.24)',
+        topFillColor2: isBuy ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.06)',
+        bottomFillColor1: isBuy ? 'rgba(239, 68, 68, 0.06)' : 'rgba(16, 185, 129, 0.08)',
+        bottomFillColor2: isBuy ? 'rgba(239, 68, 68, 0.24)' : 'rgba(16, 185, 129, 0.26)',
+        topLineColor: 'transparent',
+        bottomLineColor: 'transparent',
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+
+      if (!Number.isNaN(tp)) {
+        tpZoneSeries.setData(zoneCandles.map((c) => ({ time: c.time, value: tp })));
+      }
+      if (!Number.isNaN(sl)) {
+        slZoneSeries.setData(zoneCandles.map((c) => ({ time: c.time, value: sl })));
+      }
+
+      // Crisp Price Lines for Entry, Stop Loss, Exit TP, and 3x ATR Trail
+      if (!Number.isNaN(tp)) {
+        candleSeries.createPriceLine({
+          price: tp,
+          color: '#10b981',
+          lineWidth: 2,
+          lineStyle: 0,
+          axisLabelVisible: true,
+          title: `🎯 EXIT TP (${activeOverlaySignal.direction})`,
+        });
+      }
+      if (!Number.isNaN(entry)) {
+        candleSeries.createPriceLine({
+          price: entry,
+          color: '#e2e8f0',
+          lineWidth: 2,
+          lineStyle: 0,
+          axisLabelVisible: true,
+          title: `ENTRY (${activeOverlaySignal.direction})`,
+        });
+      }
+      if (!Number.isNaN(trail)) {
+        candleSeries.createPriceLine({
+          price: trail,
+          color: '#22d3ee',
+          lineWidth: 2,
+          lineStyle: 1,
+          axisLabelVisible: true,
+          title: '🛡️ 3x ATR TRAIL',
+        });
+      }
+      if (!Number.isNaN(sl)) {
+        candleSeries.createPriceLine({
+          price: sl,
+          color: '#f43f5e',
+          lineWidth: 2,
+          lineStyle: 0,
+          axisLabelVisible: true,
+          title: '🛑 STOP LOSS',
+        });
+      }
     }
 
     chart.timeScale().fitContent();
@@ -154,7 +254,7 @@ export default function App() {
       window.removeEventListener('resize', handleResize);
       chart.remove();
     };
-  }, [chartMode, candles, levels]);
+  }, [chartMode, candles, levels, activeOverlaySignal]);
 
   const handleManualScan = async () => {
     setScanning(true);
@@ -180,6 +280,26 @@ export default function App() {
     }
   };
 
+  const handleCopyLevels = (sig, key) => {
+    const text = [
+      `LIQUID CASH — ${sig.pair} (${sig.direction})`,
+      `Entry: ${sig.entry_price}`,
+      `Stop Loss: ${sig.stop_loss}`,
+      `Exit Target (TP): ${sig.take_profit_liquidity}`,
+      `3x ATR Trail: ${sig.trailing_atr_exit}`,
+    ].join('\n');
+    navigator.clipboard.writeText(text);
+    setCopiedId(key);
+    setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const handleVisualizeSignal = (sig) => {
+    setSelectedPair(sig.pair);
+    setInspectedSignal(sig);
+    setChartMode('bsl');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   const visibleSignals = filterByPair
     ? signals.filter((s) => s.pair === selectedPair)
     : signals;
@@ -187,6 +307,15 @@ export default function App() {
   const closedTrades = signals.filter((s) => s.status === 'WON' || s.status === 'LOST');
   const wonTrades = signals.filter((s) => s.status === 'WON').length;
   const winRate = closedTrades.length > 0 ? Math.round((wonTrades / closedTrades.length) * 100) : null;
+
+  // Calculate Risk:Reward ratio for the active overlay signal
+  const calcRR = (sig) => {
+    if (!sig) return null;
+    const risk = Math.abs(Number(sig.entry_price) - Number(sig.stop_loss));
+    const reward = Math.abs(Number(sig.take_profit_liquidity) - Number(sig.entry_price));
+    if (!risk) return null;
+    return (reward / risk).toFixed(2);
+  };
 
   return (
     <div className="min-h-screen bg-[#070d19] text-slate-100 p-4 md:p-6 font-sans">
@@ -198,11 +327,22 @@ export default function App() {
               <Activity className="w-5 h-5" />
             </div>
             <div>
-              <div className="flex items-center gap-2.5">
+              <div className="flex flex-wrap items-center gap-2">
                 <h1 className="text-lg md:text-xl font-bold tracking-tight text-white">LIQUID CASH</h1>
                 <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
                   MAEE ENGINE
                 </span>
+                {levels?.session && (
+                  <span
+                    className={`text-[11px] font-medium px-2.5 py-0.5 rounded-full border ${
+                      levels.in_session
+                        ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                        : 'bg-slate-800 text-slate-400 border-slate-700'
+                    }`}
+                  >
+                    {levels.session}
+                  </span>
+                )}
               </div>
               <p className="text-xs text-slate-400">
                 Institutional Liquidity Sweep &amp; Maximum Adverse/Favorable Excursion Monitor
@@ -236,7 +376,7 @@ export default function App() {
           </div>
         </header>
 
-        {/* Graceful Twelve Data Quota Notice (Never blocks TradingView) */}
+        {/* Graceful Twelve Data Quota Notice */}
         {quotaNotice && (
           <div className="flex items-center justify-between gap-3 px-4 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs">
             <span>{quotaNotice}</span>
@@ -282,7 +422,7 @@ export default function App() {
                     : 'text-slate-400 hover:text-white'
                 }`}
               >
-                BSL/SSL Chart
+                Trade Setup &amp; BSL/SSL
               </button>
             </div>
 
@@ -365,48 +505,104 @@ export default function App() {
           </div>
         </div>
 
-        {/* Active Setup Banner if triggered on current pair */}
-        {liveSignal && (
-          <div className="bg-emerald-500/10 border border-emerald-500/40 rounded-2xl p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        {/* Active Setup Banner with Copy-Trade Levels */}
+        {activeOverlaySignal && (
+          <div className="bg-emerald-500/10 border border-emerald-500/40 rounded-2xl p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
             <div className="flex items-start gap-3">
               <Target className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
               <div>
-                <div className="text-sm font-bold text-emerald-300">
-                  LIVE SETUP DETECTED: {liveSignal.pair} ({liveSignal.direction}) — {liveSignal.candle_pattern}
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-bold text-emerald-300">
+                    {activeOverlaySignal.pair} ({activeOverlaySignal.direction}) — {activeOverlaySignal.candle_pattern}
+                  </span>
+                  {calcRR(activeOverlaySignal) && (
+                    <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
+                      {calcRR(activeOverlaySignal)}R Target
+                    </span>
+                  )}
                 </div>
-                <div className="text-xs text-slate-300 mt-0.5">
-                  Entry: <span className="font-mono text-white">{liveSignal.entry_price}</span> · SL:{' '}
-                  <span className="font-mono text-rose-400">{liveSignal.stop_loss}</span> · Liquidity Exit TP:{' '}
-                  <span className="font-mono text-amber-300">{liveSignal.take_profit_liquidity}</span> · 3x ATR Trail:{' '}
-                  <span className="font-mono text-sky-300">{liveSignal.trailing_atr_exit}</span>
+                <div className="text-xs text-slate-300 mt-1 flex flex-wrap gap-x-3 gap-y-1">
+                  <span>
+                    Entry: <strong className="font-mono text-white">{activeOverlaySignal.entry_price}</strong>
+                  </span>
+                  <span>
+                    Stop Loss: <strong className="font-mono text-rose-400">{activeOverlaySignal.stop_loss}</strong>
+                  </span>
+                  <span>
+                    Exit TP: <strong className="font-mono text-emerald-400">{activeOverlaySignal.take_profit_liquidity}</strong>
+                  </span>
+                  <span>
+                    3x ATR Trail: <strong className="font-mono text-cyan-300">{activeOverlaySignal.trailing_atr_exit}</strong>
+                  </span>
                 </div>
               </div>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              {chartMode !== 'bsl' && (
+                <button
+                  onClick={() => setChartMode('bsl')}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-slate-950 hover:bg-amber-400 transition"
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                  Show TP/SL on Chart
+                </button>
+              )}
+              <button
+                onClick={() => handleCopyLevels(activeOverlaySignal, 'banner')}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 transition"
+              >
+                {copiedId === 'banner' ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    Copied!
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    Copy MT4/MT5 Levels
+                  </>
+                )}
+              </button>
             </div>
           </div>
         )}
 
-        {/* Main Chart Container (Live TV Chart by default) */}
+        {/* Main Chart Container */}
         <div className="bg-[#0d1526] border border-slate-800/90 rounded-2xl p-4">
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
             <h2 className="text-sm font-semibold text-white">
-              {selectedPair} {chartMode === 'tv' ? 'Live TradingView Chart' : `Liquidity & MAEE Chart (${interval})`}
+              {selectedPair}{' '}
+              {chartMode === 'tv'
+                ? 'Live TradingView Chart'
+                : `Trade Position & Liquidity Chart (${interval})`}
             </h2>
-            {levels && (
-              <div className="flex items-center gap-4 text-xs">
-                <span className="text-amber-400 font-medium">● BSL {levels.bsl}</span>
-                <span className="text-sky-400 font-medium">● SSL {levels.ssl}</span>
-              </div>
-            )}
+            <div className="flex flex-wrap items-center gap-3 text-xs">
+              {activeOverlaySignal && chartMode === 'bsl' && (
+                <>
+                  <span className="text-emerald-400 font-medium">■ TP {activeOverlaySignal.take_profit_liquidity}</span>
+                  <span className="text-slate-200 font-medium">― Entry {activeOverlaySignal.entry_price}</span>
+                  <span className="text-cyan-300 font-medium">┄ 3x ATR {activeOverlaySignal.trailing_atr_exit}</span>
+                  <span className="text-rose-400 font-medium">■ SL {activeOverlaySignal.stop_loss}</span>
+                </>
+              )}
+              {levels && (
+                <>
+                  <span className="text-amber-400 font-medium">● BSL {levels.bsl}</span>
+                  <span className="text-sky-400 font-medium">● SSL {levels.ssl}</span>
+                </>
+              )}
+            </div>
           </div>
 
           {chartMode === 'tv' ? (
             <LiveChart selectedPair={selectedPair} />
           ) : (
-            <div ref={chartContainerRef} className="w-full h-[450px] rounded-xl overflow-hidden" />
+            <div ref={chartContainerRef} className="w-full h-[460px] rounded-xl overflow-hidden" />
           )}
         </div>
 
-        {/* Supabase Signals & Outcome Tracking */}
+        {/* Supabase Signals & Copy-Trade Log */}
         <div className="bg-[#0d1526] border border-slate-800/90 rounded-2xl p-4">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
             <div className="flex items-center gap-2.5">
@@ -435,61 +631,91 @@ export default function App() {
 
           {visibleSignals.length === 0 ? (
             <p className="text-xs text-slate-400 py-4 text-center">
-              No signals logged yet. The backend scheduler scans every 15 minutes (or click{' '}
+              No signals logged yet. The backend scheduler scans every 15 minutes during London &amp; NY sessions (or click{' '}
               <span className="text-emerald-400 font-medium">Scan All Pairs</span> above) for BSL/SSL sweeps and MAEE exit triggers.
             </p>
           ) : (
             <div className="space-y-2.5">
-              {visibleSignals.map((sig, idx) => (
-                <div
-                  key={sig.id || idx}
-                  className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 p-3 rounded-xl bg-[#070d19] border border-slate-800/80"
-                >
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-xs font-bold text-white">{sig.pair}</span>
-                      <span
-                        className={`text-[11px] font-bold px-2 py-0.5 rounded ${
-                          sig.direction === 'BUY'
-                            ? 'bg-emerald-500/20 text-emerald-400'
-                            : 'bg-rose-500/20 text-rose-400'
-                        }`}
-                      >
-                        {sig.direction}
-                      </span>
-                      <span className="text-xs text-slate-300">{sig.candle_pattern}</span>
-                      <span className="text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
-                        {sig.status || 'ACTIVE'}
-                      </span>
+              {visibleSignals.map((sig, idx) => {
+                const sigKey = sig.id || idx;
+                return (
+                  <div
+                    key={sigKey}
+                    className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 p-3 rounded-xl bg-[#070d19] border border-slate-800/80"
+                  >
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-bold text-white">{sig.pair}</span>
+                        <span
+                          className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                            sig.direction === 'BUY'
+                              ? 'bg-emerald-500/20 text-emerald-400'
+                              : 'bg-rose-500/20 text-rose-400'
+                          }`}
+                        >
+                          {sig.direction}
+                        </span>
+                        <span className="text-xs text-slate-300">{sig.candle_pattern}</span>
+                        <span className="text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                          {sig.status || 'ACTIVE'}
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-400 mt-1">
+                        Entry: <span className="text-slate-200 font-mono">{sig.entry_price}</span> · SL:{' '}
+                        <span className="text-rose-400 font-mono">{sig.stop_loss}</span> · Exit TP:{' '}
+                        <span className="text-emerald-400 font-mono">{sig.take_profit_liquidity}</span> · 3x ATR Trail:{' '}
+                        <span className="text-cyan-300 font-mono">{sig.trailing_atr_exit}</span>
+                      </div>
                     </div>
-                    <div className="text-xs text-slate-400 mt-1">
-                      Entry: <span className="text-slate-200 font-mono">{sig.entry_price}</span> · SL:{' '}
-                      <span className="text-rose-400 font-mono">{sig.stop_loss}</span> · Exit TP:{' '}
-                      <span className="text-amber-300 font-mono">{sig.take_profit_liquidity}</span> · 3x ATR Trail:{' '}
-                      <span className="text-sky-300 font-mono">{sig.trailing_atr_exit}</span>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => handleVisualizeSignal(sig)}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30"
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                        Plot on Chart
+                      </button>
+
+                      <button
+                        onClick={() => handleCopyLevels(sig, sigKey)}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                      >
+                        {copiedId === sigKey ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            Copied
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            Copy Levels
+                          </>
+                        )}
+                      </button>
+
+                      {sig.id && sig.status === 'ACTIVE' && (
+                        <>
+                          <button
+                            onClick={() => handleUpdateSignal(sig.id, 'WON')}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Won
+                          </button>
+                          <button
+                            onClick={() => handleUpdateSignal(sig.id, 'LOST')}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 border border-rose-500/30"
+                          >
+                            <XCircle className="w-3.5 h-3.5" />
+                            Lost
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
-
-                  {sig.id && sig.status === 'ACTIVE' && (
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        onClick={() => handleUpdateSignal(sig.id, 'WON')}
-                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30"
-                      >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        Won
-                      </button>
-                      <button
-                        onClick={() => handleUpdateSignal(sig.id, 'LOST')}
-                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 border border-rose-500/30"
-                      >
-                        <XCircle className="w-3.5 h-3.5" />
-                        Lost
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
