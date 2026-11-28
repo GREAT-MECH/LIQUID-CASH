@@ -561,4 +561,224 @@ def simulate_pair_backtest(pair: str, interval: str = "1h", bars: int = 500) -> 
     }
 
 
-def run_market_scan(force_refresh
+def run_market_scan(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    in_session, session_name = get_active_session()
+    if not in_session and not force_refresh:
+        print(f"Skipping automated scan ({session_name})")
+        return []
+
+    triggered: List[Dict[str, Any]] = []
+    for pair in PAIRS:
+        try:
+            df = fetch_candles(pair, "1h", 500, force_refresh=force_refresh)
+            signal, _ = analyze_maee_liquidity(df, pair, "1h", ignore_session=False)
+            if signal:
+                triggered.append(signal)
+                if supabase:
+                    supabase.table("signals").insert(signal).execute()
+                msg = (
+                    f"💧 *LIQUID CASH (1:3 R:R) — {signal['pair']} ({signal['direction']})*\n"
+                    f"• *Setup:* {signal['candle_pattern']}\n"
+                    f"• *Swept Liquidity:* `{signal['liquidity_zone']}`\n"
+                    f"• *Entry:* `{signal['entry_price']}`\n"
+                    f"• *Stop Loss (2 pips):* `{signal['stop_loss']}`\n"
+                    f"• *Take Profit (1:3):* `{signal['take_profit_liquidity']}`"
+                )
+                send_telegram(msg)
+        except Exception as exc:
+            print(f"Scan error on {pair}: {exc}")
+    return triggered
+
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(run_market_scan, "interval", minutes=15)
+scheduler.start()
+
+
+@app.get("/api/health")
+@app.head("/api/health")
+def health_check():
+    in_session, session_name = get_active_session()
+    return {
+        "service": "LIQUID CASH Engine",
+        "status": "running",
+        "session": session_name,
+        "in_session": in_session,
+        "pairs": PAIRS,
+        "quota_paused": time.time() < QUOTA_EXHAUSTED_UNTIL,
+    }
+
+
+@app.post("/api/scan")
+def trigger_manual_scan():
+    signals = run_market_scan(force_refresh=True)
+    return {"scanned_pairs": len(PAIRS), "new_signals": len(signals), "signals": signals}
+
+
+@app.get("/api/chart/{pair:path}")
+def get_chart_data(pair: str, interval: str = "1h"):
+    symbol = normalize_pair(pair)
+    tf = normalize_interval(interval)
+    try:
+        df = fetch_candles(symbol, tf, 500)
+        signal, levels = analyze_maee_liquidity(df, symbol, tf, ignore_session=False)
+        candles = [
+            {
+                "time": parse_candle_timestamp(row["datetime"]),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
+            for _, row in df.tail(260).iterrows()
+        ]
+        return {
+            "pair": symbol,
+            "interval": tf,
+            "candles": candles,
+            "levels": levels,
+            "live_signal": signal,
+            "quota_paused": time.time() < QUOTA_EXHAUSTED_UNTIL,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest/{pair:path}")
+def run_historical_backtest(pair: str, interval: str = "1h", bars: int = 500):
+    try:
+        return simulate_pair_backtest(pair, interval, bars)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/backtest-all")
+def run_all_pairs_backtest(interval: str = "1h", bars: int = 500):
+    tf = normalize_interval(interval)
+    per_pair: List[Dict[str, Any]] = []
+    all_trades: List[Dict[str, Any]] = []
+
+    for pair in PAIRS:
+        try:
+            res = simulate_pair_backtest(pair, tf, bars)
+            summary = res.get("summary", {})
+            per_pair.append({
+                "pair": pair,
+                "closed_trades": summary.get("closed_trades", 0),
+                "wins": summary.get("wins", 0),
+                "losses": summary.get("losses", 0),
+                "win_rate": summary.get("win_rate", 0.0),
+                "net_r": summary.get("net_r", 0.0),
+            })
+            all_trades.extend(res.get("trades", []))
+        except Exception as exc:
+            per_pair.append({
+                "pair": pair,
+                "closed_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "net_r": 0.0,
+                "error": str(exc),
+            })
+
+    closed = [t for t in all_trades if t["status"] in ("WON", "LOST")]
+    wins = [t for t in closed if t["status"] == "WON"]
+    losses = [t for t in closed if t["status"] == "LOST"]
+    win_rate = round((len(wins) / len(closed)) * 100, 1) if closed else 0.0
+    net_r = round(sum(t["net_r"] for t in closed), 2)
+
+    all_trades.sort(key=lambda t: t.get("entry_ts", 0), reverse=True)
+    per_pair.sort(key=lambda p: p.get("net_r", 0), reverse=True)
+
+    return {
+        "interval": tf,
+        "bars_tested": bars,
+        "summary": {
+            "total_signals": len(all_trades),
+            "closed_trades": len(closed),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": win_rate,
+            "net_r": net_r,
+        },
+        "per_pair": per_pair,
+        "trades": all_trades,
+    }
+
+
+@app.get("/api/signals")
+def get_signals():
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("signals")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(25)
+            .execute()
+        )
+        return res.data or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.patch("/api/signals/{signal_id}")
+def update_signal_status(signal_id: str, body: SignalStatusUpdate):
+    if not supabase:
+        raise HTTPException(status_code=400, detail="Supabase is not configured")
+    allowed = {"ACTIVE", "WON", "LOST", "CLOSED"}
+    next_status = body.status.strip().upper()
+    if next_status not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {next_status}")
+    try:
+        res = (
+            supabase.table("signals")
+            .update({"status": next_status})
+            .eq("id", signal_id)
+            .execute()
+        )
+        return {"updated": True, "data": res.data}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# --- Serve Built React Frontend ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIST = next(
+    (
+        candidate
+        for candidate in [
+            os.path.join(BASE_DIR, "frontend", "dist"),
+            os.path.join(BASE_DIR, "dist"),
+            os.path.join(BASE_DIR, "..", "frontend", "dist"),
+            os.path.join(BASE_DIR, "..", "dist"),
+        ]
+        if os.path.exists(candidate)
+    ),
+    None,
+)
+
+if FRONTEND_DIST:
+    assets_dir = os.path.join(FRONTEND_DIST, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        file_path = os.path.join(FRONTEND_DIST, full_path)
+        if full_path and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+else:
+    @app.get("/")
+    def root_fallback():
+        return {
+            "service": "LIQUID CASH Engine",
+            "status": "running",
+            "pairs": PAIRS,
+            "note": "Frontend dist folder not built yet.",
+        }
