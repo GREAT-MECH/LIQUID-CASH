@@ -15,6 +15,7 @@ import {
   Check,
   Eye,
   History,
+  Layers,
 } from 'lucide-react';
 import LiveChart from './LiveChart';
 
@@ -34,11 +35,12 @@ export default function App() {
   const [signals, setSignals] = useState([]);
   const [filterByPair, setFilterByPair] = useState(false);
 
-  // Historical Backtest State
+  // Single-pair & All-5-Pairs Backtest State
   const [backtesting, setBacktesting] = useState(false);
+  const [backtestingAll, setBacktestingAll] = useState(false);
   const [backtestBars, setBacktestBars] = useState(300);
   const [backtestResult, setBacktestResult] = useState(null);
-  const [activeLogTab, setActiveLogTab] = useState('live'); // 'live' | 'backtest'
+  const [activeLogTab, setActiveLogTab] = useState('live');
 
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -109,7 +111,7 @@ export default function App() {
       ? inspectedSignal
       : liveSignal || signals.find((s) => s.pair === selectedPair) || null;
 
-  // Render TradingView-Style Long/Short Position Tool + BSL/SSL Chart
+  // YouTube / ICT-Grade Institutional Chart Rendering (Anchored TP/SL Boxes + Markers + EMAs)
   useEffect(() => {
     if (chartMode !== 'bsl' || !chartContainerRef.current || candles.length === 0) return;
 
@@ -118,29 +120,67 @@ export default function App() {
 
     const chart = createChart(container, {
       layout: {
-        background: { type: ColorType.Solid, color: '#0b1120' },
-        textColor: '#94a3b8',
+        background: { type: ColorType.Solid, color: '#090f1d' },
+        textColor: '#cbd5e1',
       },
       grid: {
-        vertLines: { color: '#1e293b' },
-        horzLines: { color: '#1e293b' },
+        vertLines: { color: 'rgba(30, 41, 59, 0.55)' },
+        horzLines: { color: 'rgba(30, 41, 59, 0.55)' },
+      },
+      crosshair: {
+        mode: 1,
       },
       width: container.clientWidth,
-      height: 460,
-      timeScale: { timeVisible: true, secondsVisible: false },
-      rightPriceScale: { borderColor: '#1e293b' },
+      height: 490,
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: false,
+        borderColor: '#1e293b',
+      },
+      rightPriceScale: {
+        borderColor: '#1e293b',
+        scaleMargins: { top: 0.12, bottom: 0.12 },
+      },
     });
+
+    // 50 & 200 EMA Institutional Trend Curves
+    const ema50Data = candles.filter((c) => c.ema50).map((c) => ({ time: c.time, value: c.ema50 }));
+    const ema200Data = candles.filter((c) => c.ema200).map((c) => ({ time: c.time, value: c.ema200 }));
+
+    if (ema200Data.length > 0) {
+      const ema200Series = chart.addLineSeries({
+        color: 'rgba(168, 85, 247, 0.65)',
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        title: 'EMA 200',
+      });
+      ema200Series.setData(ema200Data);
+    }
+
+    if (ema50Data.length > 0) {
+      const ema50Series = chart.addLineSeries({
+        color: 'rgba(56, 189, 248, 0.55)',
+        lineWidth: 1,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        title: 'EMA 50',
+      });
+      ema50Series.setData(ema50Data);
+    }
 
     const candleSeries = chart.addCandlestickSeries({
       upColor: '#10b981',
-      downColor: '#ef4444',
-      borderVisible: false,
+      downColor: '#f43f5e',
+      borderUpColor: '#10b981',
+      borderDownColor: '#f43f5e',
       wickUpColor: '#10b981',
-      wickDownColor: '#ef4444',
+      wickDownColor: '#f43f5e',
     });
 
     candleSeries.setData(candles);
 
+    // BSL & SSL Liquidity Zones
     if (levels?.bsl) {
       candleSeries.createPriceLine({
         price: Number(levels.bsl),
@@ -148,7 +188,7 @@ export default function App() {
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,
-        title: 'BSL',
+        title: 'BSL POOL',
       });
     }
     if (levels?.ssl) {
@@ -158,10 +198,11 @@ export default function App() {
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,
-        title: 'SSL',
+        title: 'SSL POOL',
       });
     }
 
+    // Anchored YouTube-Style Long/Short Position Tool Box + Entry/Exit Arrows
     if (activeOverlaySignal) {
       const entry = Number(activeOverlaySignal.entry_price);
       const sl = Number(activeOverlaySignal.stop_loss);
@@ -169,37 +210,88 @@ export default function App() {
       const trail = Number(activeOverlaySignal.trailing_atr_exit);
       const isBuy = activeOverlaySignal.direction === 'BUY';
 
-      const zoneCandles = candles.slice(-25);
+      // Anchor box to the exact entry candle -> exit candle when inspecting a historical trade
+      const entryTs = Number(activeOverlaySignal.entry_ts || 0);
+      const exitTs = Number(activeOverlaySignal.exit_ts || 0);
+
+      let startIdx = Math.max(0, candles.length - 24);
+      let endIdx = candles.length - 1;
+
+      if (entryTs > 0) {
+        const foundStart = candles.findIndex((c) => c.time >= entryTs);
+        if (foundStart !== -1) {
+          startIdx = foundStart;
+          if (exitTs > 0) {
+            const foundEnd = candles.findIndex((c) => c.time >= exitTs);
+            endIdx = foundEnd !== -1 ? Math.max(foundEnd, startIdx + 2) : Math.min(candles.length - 1, startIdx + 18);
+          } else {
+            endIdx = Math.min(candles.length - 1, startIdx + 18);
+          }
+        }
+      }
+
+      const boxCandles = candles.slice(startIdx, endIdx + 1);
 
       const tpZoneSeries = chart.addBaselineSeries({
         baseValue: { type: 'price', price: entry },
-        topFillColor1: isBuy ? 'rgba(16, 185, 129, 0.26)' : 'rgba(239, 68, 68, 0.24)',
-        topFillColor2: isBuy ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.06)',
-        bottomFillColor1: isBuy ? 'rgba(239, 68, 68, 0.06)' : 'rgba(16, 185, 129, 0.08)',
-        bottomFillColor2: isBuy ? 'rgba(239, 68, 68, 0.24)' : 'rgba(16, 185, 129, 0.26)',
-        topLineColor: 'transparent',
-        bottomLineColor: 'transparent',
+        topFillColor1: isBuy ? 'rgba(16, 185, 129, 0.34)' : 'rgba(244, 63, 94, 0.32)',
+        topFillColor2: isBuy ? 'rgba(16, 185, 129, 0.14)' : 'rgba(244, 63, 94, 0.12)',
+        bottomFillColor1: isBuy ? 'rgba(244, 63, 94, 0.12)' : 'rgba(16, 185, 129, 0.14)',
+        bottomFillColor2: isBuy ? 'rgba(244, 63, 94, 0.32)' : 'rgba(16, 185, 129, 0.34)',
+        topLineColor: isBuy ? '#10b981' : '#f43f5e',
+        bottomLineColor: isBuy ? '#f43f5e' : '#10b981',
+        lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
       });
 
       const slZoneSeries = chart.addBaselineSeries({
         baseValue: { type: 'price', price: entry },
-        topFillColor1: isBuy ? 'rgba(16, 185, 129, 0.26)' : 'rgba(239, 68, 68, 0.24)',
-        topFillColor2: isBuy ? 'rgba(16, 185, 129, 0.08)' : 'rgba(239, 68, 68, 0.06)',
-        bottomFillColor1: isBuy ? 'rgba(239, 68, 68, 0.06)' : 'rgba(16, 185, 129, 0.08)',
-        bottomFillColor2: isBuy ? 'rgba(239, 68, 68, 0.24)' : 'rgba(16, 185, 129, 0.26)',
-        topLineColor: 'transparent',
-        bottomLineColor: 'transparent',
+        topFillColor1: isBuy ? 'rgba(16, 185, 129, 0.34)' : 'rgba(244, 63, 94, 0.32)',
+        topFillColor2: isBuy ? 'rgba(16, 185, 129, 0.14)' : 'rgba(244, 63, 94, 0.12)',
+        bottomFillColor1: isBuy ? 'rgba(244, 63, 94, 0.12)' : 'rgba(16, 185, 129, 0.14)',
+        bottomFillColor2: isBuy ? 'rgba(244, 63, 94, 0.32)' : 'rgba(16, 185, 129, 0.34)',
+        topLineColor: isBuy ? '#10b981' : '#f43f5e',
+        bottomLineColor: isBuy ? '#f43f5e' : '#10b981',
+        lineWidth: 2,
         priceLineVisible: false,
         lastValueVisible: false,
       });
 
-      if (!Number.isNaN(tp)) {
-        tpZoneSeries.setData(zoneCandles.map((c) => ({ time: c.time, value: tp })));
+      if (boxCandles.length > 0 && !Number.isNaN(tp)) {
+        tpZoneSeries.setData(boxCandles.map((c) => ({ time: c.time, value: tp })));
       }
-      if (!Number.isNaN(sl)) {
-        slZoneSeries.setData(zoneCandles.map((c) => ({ time: c.time, value: sl })));
+      if (boxCandles.length > 0 && !Number.isNaN(sl)) {
+        slZoneSeries.setData(boxCandles.map((c) => ({ time: c.time, value: sl })));
+      }
+
+      // Candle Arrows for Exact Entry & Outcome (Just like YouTube Trade Breakdowns)
+      const markers = [];
+      if (boxCandles[0]) {
+        markers.push({
+          time: boxCandles[0].time,
+          position: isBuy ? 'belowBar' : 'aboveBar',
+          color: isBuy ? '#10b981' : '#f43f5e',
+          shape: isBuy ? 'arrowUp' : 'arrowDown',
+          text: `${activeOverlaySignal.direction} @ ${activeOverlaySignal.entry_price}`,
+        });
+      }
+      if (
+        boxCandles.length > 1 &&
+        (activeOverlaySignal.status === 'WON' || activeOverlaySignal.status === 'LOST')
+      ) {
+        const lastBoxCandle = boxCandles[boxCandles.length - 1];
+        const won = activeOverlaySignal.status === 'WON';
+        markers.push({
+          time: lastBoxCandle.time,
+          position: won ? (isBuy ? 'aboveBar' : 'belowBar') : (isBuy ? 'belowBar' : 'aboveBar'),
+          color: won ? '#10b981' : '#f43f5e',
+          shape: 'circle',
+          text: won ? `🎯 TP HIT (+${activeOverlaySignal.net_r ?? ''}R)` : '🛑 SL HIT (-1R)',
+        });
+      }
+      if (markers.length > 0) {
+        candleSeries.setMarkers(markers);
       }
 
       if (!Number.isNaN(tp)) {
@@ -209,17 +301,17 @@ export default function App() {
           lineWidth: 2,
           lineStyle: 0,
           axisLabelVisible: true,
-          title: `🎯 EXIT TP (${activeOverlaySignal.direction})`,
+          title: `🎯 EXIT TP`,
         });
       }
       if (!Number.isNaN(entry)) {
         candleSeries.createPriceLine({
           price: entry,
-          color: '#e2e8f0',
+          color: '#f8fafc',
           lineWidth: 2,
           lineStyle: 0,
           axisLabelVisible: true,
-          title: `ENTRY (${activeOverlaySignal.direction})`,
+          title: `ENTRY`,
         });
       }
       if (!Number.isNaN(trail)) {
@@ -242,9 +334,14 @@ export default function App() {
           title: '🛑 STOP LOSS',
         });
       }
-    }
 
-    chart.timeScale().fitContent();
+      // Focus chart window cleanly around the trade setup
+      const visibleFrom = Math.max(0, startIdx - 18);
+      const visibleTo = Math.min(candles.length - 1, endIdx + 10);
+      chart.timeScale().setVisibleLogicalRange({ from: visibleFrom, to: visibleTo });
+    } else {
+      chart.timeScale().fitContent();
+    }
 
     const handleResize = () => {
       if (chartContainerRef.current) {
@@ -279,13 +376,35 @@ export default function App() {
       );
       if (res.ok) {
         const data = await res.json();
-        setBacktestResult(data);
+        setBacktestResult({ ...data, mode: 'single' });
         if (data.trades && data.trades.length > 0) {
           setInspectedSignal(data.trades[0]);
         }
       }
     } finally {
       setBacktesting(false);
+    }
+  };
+
+  const handleRunAllPairsBacktest = async (barsOverride) => {
+    const barsToTest = barsOverride || backtestBars;
+    setBacktestingAll(true);
+    setActiveLogTab('backtest');
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/backtest-all?interval=${interval}&bars=${barsToTest}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setBacktestResult({ ...data, mode: 'all' });
+        if (data.trades && data.trades.length > 0) {
+          const first = data.trades[0];
+          setSelectedPair(first.pair);
+          setInspectedSignal(first);
+        }
+      }
+    } finally {
+      setBacktestingAll(false);
     }
   };
 
@@ -372,13 +491,21 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             {lastUpdated && (
-              <span className="text-xs text-slate-400">Updated {lastUpdated}</span>
+              <span className="text-xs text-slate-400 mr-1">Updated {lastUpdated}</span>
             )}
             <button
+              onClick={() => handleRunAllPairsBacktest(backtestBars)}
+              disabled={backtestingAll || backtesting}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition disabled:opacity-50"
+            >
+              <Layers className={`w-3.5 h-3.5 ${backtestingAll ? 'animate-spin' : ''}`} />
+              {backtestingAll ? 'Testing All 5...' : 'Backtest All 5 Pairs'}
+            </button>
+            <button
               onClick={() => handleRunBacktest(backtestBars)}
-              disabled={backtesting}
+              disabled={backtesting || backtestingAll}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white transition disabled:opacity-50"
             >
               <History className={`w-3.5 h-3.5 ${backtesting ? 'animate-spin' : ''}`} />
@@ -390,7 +517,7 @@ export default function App() {
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition disabled:opacity-50"
             >
               <Radio className={`w-3.5 h-3.5 ${scanning ? 'animate-ping' : ''}`} />
-              {scanning ? 'Scanning 5 Pairs...' : 'Scan All Pairs'}
+              {scanning ? 'Scanning...' : 'Scan All Pairs'}
             </button>
             <button
               onClick={() => {
@@ -535,7 +662,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Active / Inspected Setup Banner with Copy-Trade Levels */}
+        {/* Active / Inspected Setup Banner */}
         {activeOverlaySignal && (
           <div className="bg-emerald-500/10 border border-emerald-500/40 rounded-2xl p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
             <div className="flex items-start gap-3">
@@ -610,7 +737,7 @@ export default function App() {
               {selectedPair}{' '}
               {chartMode === 'tv'
                 ? 'Live TradingView Chart'
-                : `Trade Position & Liquidity Chart (${interval})`}
+                : `Institutional Trade Position & Liquidity Chart (${interval})`}
             </h2>
             <div className="flex flex-wrap items-center gap-3 text-xs">
               {activeOverlaySignal && chartMode === 'bsl' && (
@@ -625,6 +752,7 @@ export default function App() {
                 <>
                   <span className="text-amber-400 font-medium">● BSL {levels.bsl}</span>
                   <span className="text-sky-400 font-medium">● SSL {levels.ssl}</span>
+                  <span className="text-purple-400 font-medium">― EMA 200</span>
                 </>
               )}
             </div>
@@ -633,7 +761,7 @@ export default function App() {
           {chartMode === 'tv' ? (
             <LiveChart selectedPair={selectedPair} />
           ) : (
-            <div ref={chartContainerRef} className="w-full h-[460px] rounded-xl overflow-hidden" />
+            <div ref={chartContainerRef} className="w-full h-[490px] rounded-xl overflow-hidden" />
           )}
         </div>
 
@@ -680,13 +808,17 @@ export default function App() {
                 {filterByPair ? `Showing ${selectedPair} Only` : 'Filter by Selected Pair'}
               </button>
             ) : (
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {[250, 450].map((bars) => (
                   <button
                     key={bars}
                     onClick={() => {
                       setBacktestBars(bars);
-                      handleRunBacktest(bars);
+                      if (backtestResult?.mode === 'all') {
+                        handleRunAllPairsBacktest(bars);
+                      } else {
+                        handleRunBacktest(bars);
+                      }
                     }}
                     className={`text-xs px-2.5 py-1 rounded-lg border transition ${
                       backtestBars === bars
@@ -706,12 +838,12 @@ export default function App() {
               <p className="text-xs text-slate-400 py-4 text-center">
                 No live signals logged yet. Click{' '}
                 <button
-                  onClick={() => handleRunBacktest(backtestBars)}
-                  className="text-purple-400 underline font-medium"
+                  onClick={() => handleRunAllPairsBacktest(backtestBars)}
+                  className="text-indigo-400 underline font-medium"
                 >
-                  Backtest {selectedPair}
+                  Backtest All 5 Pairs
                 </button>{' '}
-                to see how this strategy performed over previous weeks right now.
+                to see how this strategy performed across every pair over the past weeks.
               </p>
             ) : (
               <div className="space-y-2.5">
@@ -800,20 +932,30 @@ export default function App() {
               {!backtestResult ? (
                 <div className="text-center py-6 space-y-3">
                   <p className="text-xs text-slate-400">
-                    Run a historical simulation on <strong>{selectedPair} ({interval})</strong> to see every signal that would have fired over the past weeks and whether TP or SL hit first.
+                    Run a historical simulation across <strong>all 5 pairs</strong> or <strong>{selectedPair} ({interval})</strong> to see past Wins, Losses, and Net R-multiple.
                   </p>
-                  <button
-                    onClick={() => handleRunBacktest(backtestBars)}
-                    disabled={backtesting}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white"
-                  >
-                    <History className="w-4 h-4" />
-                    {backtesting ? 'Simulating Candles...' : `Run ${selectedPair} Historical Backtest`}
-                  </button>
+                  <div className="flex flex-wrap justify-center gap-2">
+                    <button
+                      onClick={() => handleRunAllPairsBacktest(backtestBars)}
+                      disabled={backtestingAll}
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white"
+                    >
+                      <Layers className="w-4 h-4" />
+                      {backtestingAll ? 'Simulating All 5 Pairs...' : 'Backtest All 5 Pairs'}
+                    </button>
+                    <button
+                      onClick={() => handleRunBacktest(backtestBars)}
+                      disabled={backtesting}
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white"
+                    >
+                      <History className="w-4 h-4" />
+                      {backtesting ? 'Simulating Candles...' : `Backtest ${selectedPair} Only`}
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <>
-                  {/* Backtest Scoreboard */}
+                  {/* Overall Portfolio / Pair Scoreboard */}
                   <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 bg-[#070d19] border border-purple-500/30 rounded-xl p-3">
                     <div>
                       <div className="text-[11px] text-slate-400 uppercase">Closed Trades</div>
@@ -844,10 +986,41 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Per-Pair Leaderboard when Backtest All 5 Pairs is active */}
+                  {backtestResult.per_pair && backtestResult.per_pair.length > 0 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+                      {backtestResult.per_pair.map((item) => (
+                        <button
+                          key={item.pair}
+                          onClick={() => setSelectedPair(item.pair)}
+                          className={`text-left p-2.5 rounded-xl border transition ${
+                            selectedPair === item.pair
+                              ? 'bg-indigo-500/15 border-indigo-400/50'
+                              : 'bg-[#070d19] border-slate-800 hover:border-slate-700'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-white">{item.pair}</span>
+                            <span
+                              className={`text-xs font-bold ${
+                                item.net_r >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                              }`}
+                            >
+                              {item.net_r >= 0 ? `+${item.net_r}R` : `${item.net_r}R`}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-1">
+                            {item.wins}W - {item.losses}L ({item.win_rate}%)
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
                   {/* Individual Backtested Trades */}
                   {backtestResult.trades?.length === 0 ? (
                     <p className="text-xs text-slate-400 text-center py-3">
-                      No setups triggered on {selectedPair} ({interval}) in this window. Try switching to <strong>1h</strong> or <strong>4h</strong> and running the backtest again.
+                      No setups triggered in this window. Try switching to <strong>1h</strong> or <strong>4h</strong> and running the backtest again.
                     </p>
                   ) : (
                     <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1">
