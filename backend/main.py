@@ -74,6 +74,10 @@ def get_pip_multiplier(pair: str) -> float:
     return 10000.0
 
 
+def get_pip_size(pair: str) -> float:
+    return 1.0 / get_pip_multiplier(pair)
+
+
 def format_price(pair: str, value: float) -> float:
     symbol = normalize_pair(pair)
     decimals = 2 if "XAU" in symbol else (3 if "JPY" in symbol else 5)
@@ -178,18 +182,18 @@ def fetch_candles(pair: str, interval: str = "1h", outputsize: int = 500, force_
     return df
 
 
-def find_untouched_major_pools(
+def find_swing_liquidity_pools(
     df: pd.DataFrame,
-    window_bars: int = 150,
-    left_right: int = 5,
+    window_bars: int = 120,
+    left_right: int = 3,
 ) -> Tuple[float, int, float, int]:
     """
-    Finds the highest confirmed swing-pivot high (BSL) and lowest confirmed
-    swing-pivot low (SSL) over a 150-bar window (requiring 5 bars on each side).
+    Finds major swing-pivot highs (BSL) and swing-pivot lows (SSL) suitable
+    for 1H / 4H liquidity sweep analysis.
     """
     n = len(df)
     start_idx = max(left_right, n - window_bars)
-    end_idx = max(start_idx + 1, n - (left_right + 2))
+    end_idx = max(start_idx + 1, n - (left_right + 1))
 
     highs = df["high"].to_numpy(dtype=float)
     lows = df["low"].to_numpy(dtype=float)
@@ -241,16 +245,16 @@ def analyze_maee_liquidity(
     ignore_session: bool = False,
 ):
     """
-    Strict 2-Candle Confirmed Major Liquidity Sweep Continuation (1:3 R:R):
-    - Anchors BSL/SSL to untouched 150-bar confirmed 5-bar swing pivots
-    - Candle 1 (prev) breaks and closes beyond the untouched BSL/SSL pool
-    - Candle 2 (curr) holds beyond the swept level and closes strongly in the
-      continuation direction (filtering out 1-candle fakeouts like GBP/JPY 209.51)
-    - Enforces strict 1:3 Take Profit = Entry +/- (3 * Risk)
+    4H/1H Swing Liquidity Sweep -> Reversal -> Order Block / Order Flow Retest (1:3 R:R):
+    1. Detects swing high (BSL) / swing low (SSL) liquidity sweep with reversal shift
+    2. Identifies the opposing order block / order flow zone formed before the impulse
+    3. Triggers entry when price pulls back into that order block / order flow zone
+    4. Places Stop Loss 1.5 pips beyond the swept liquidity extreme, with 1:3 TP
     """
     symbol = normalize_pair(pair)
     tf = normalize_interval(timeframe)
     pip_mult = get_pip_multiplier(symbol)
+    pip_size = get_pip_size(symbol)
     in_session, session_name = get_active_session()
 
     work_df = df.copy()
@@ -265,12 +269,12 @@ def analyze_maee_liquidity(
     ).max(axis=1)
     work_df["atr"] = tr.rolling(14).mean()
 
-    bsl, bsl_idx, ssl, ssl_idx = find_untouched_major_pools(work_df, window_bars=150, left_right=5)
+    window_bars = 90 if tf == "4h" else 140
+    bsl, bsl_idx, ssl, ssl_idx = find_swing_liquidity_pools(work_df, window_bars=window_bars, left_right=3)
 
     n = len(work_df)
     curr = work_df.iloc[-1]
-    prev = work_df.iloc[-2]
-    atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else 0.0005
+    atr = float(curr["atr"]) if pd.notna(curr["atr"]) and float(curr["atr"]) > 0 else (10.0 * pip_size)
 
     if ignore_session and "datetime" in curr:
         try:
@@ -287,48 +291,127 @@ def analyze_maee_liquidity(
     high_price = float(curr["high"])
     low_price = float(curr["low"])
 
-    prev_c = float(prev["close"])
-    prev_o = float(prev["open"])
-    prev_h = float(prev["high"])
-    prev_l = float(prev["low"])
+    sl_pad = 1.5 * pip_size
+    signal: Optional[Dict[str, Any]] = None
 
-    body = abs(close_price - open_price)
-    candle_range = max(high_price - low_price, 1e-9)
-    sweep_margin = 0.25 * atr
+    # --- Bearish Setup: BSL swept -> bearish shift -> pullback into bearish Order Block ---
+    search_start_bear = max(bsl_idx + 1, n - 12)
+    sweep_high_bear: Optional[float] = None
+    sweep_pos_bear: Optional[int] = None
+    for k in range(search_start_bear, n - 1):
+        c_k = work_df.iloc[k]
+        if float(c_k["high"]) > bsl and float(c_k["close"]) < bsl:
+            sweep_high_bear = float(c_k["high"])
+            sweep_pos_bear = k
+            break
 
-    # BSL must have been completely untouched from bsl_idx+1 up to bar n-3
-    prior_before_break_bsl = work_df.iloc[bsl_idx + 1 : n - 2]
-    bsl_was_fresh = (
-        len(prior_before_break_bsl) >= 3 and float(prior_before_break_bsl["high"].max()) <= bsl
-    )
-    # Candle 1 (prev) swept & closed above BSL; Candle 2 (curr) held above BSL & closed higher
-    confirmed_bsl_continuation = (
-        bsl_was_fresh
-        and (prev_h >= bsl + sweep_margin)
-        and (prev_c > bsl)
-        and (prev_c > prev_o)
-        and (low_price >= bsl - 0.15 * atr)
-        and (close_price > prev_c)
-        and (close_price > open_price)
-        and (body >= 0.40 * candle_range)
-    )
+    if sweep_high_bear is not None and sweep_pos_bear is not None:
+        # Find last bullish candle (order block) before or at sweep that preceded bearish move
+        ob_top: Optional[float] = None
+        ob_bot: Optional[float] = None
+        for b_idx in range(sweep_pos_bear, max(0, sweep_pos_bear - 6), -1):
+            b_c = work_df.iloc[b_idx]
+            if float(b_c["close"]) > float(b_c["open"]):
+                ob_top = float(b_c["high"])
+                ob_bot = float(b_c["low"])
+                break
 
-    # SSL must have been completely untouched from ssl_idx+1 up to bar n-3
-    prior_before_break_ssl = work_df.iloc[ssl_idx + 1 : n - 2]
-    ssl_was_fresh = (
-        len(prior_before_break_ssl) >= 3 and float(prior_before_break_ssl["low"].min()) >= ssl
-    )
-    # Candle 1 (prev) swept & closed below SSL; Candle 2 (curr) held below SSL & closed lower
-    confirmed_ssl_continuation = (
-        ssl_was_fresh
-        and (prev_l <= ssl - sweep_margin)
-        and (prev_c < ssl)
-        and (prev_c < prev_o)
-        and (high_price <= ssl + 0.15 * atr)
-        and (close_price < prev_c)
-        and (close_price < open_price)
-        and (body >= 0.40 * candle_range)
-    )
+        after_sweep_bear = work_df.iloc[sweep_pos_bear + 1 : n - 1]
+        bearish_shift = (
+            len(after_sweep_bear) >= 1
+            and float(after_sweep_bear["close"].min()) < float(work_df.iloc[sweep_pos_bear]["low"])
+            and float(after_sweep_bear["high"].max()) <= sweep_high_bear
+        )
+
+        if ob_top is not None and ob_bot is not None and bearish_shift:
+            # Current candle returns into the order block / order flow zone and rejects downward
+            retest_ob_bear = (
+                (high_price >= ob_bot)
+                and (low_price <= ob_top)
+                and (high_price <= sweep_high_bear)
+                and (close_price < open_price)
+                and (close_price <= ob_top)
+            )
+            if session_allowed and retest_ob_bear:
+                entry = close_price
+                sl_raw = sweep_high_bear + sl_pad
+                risk = sl_raw - entry
+                min_risk = 2.0 * pip_size
+                max_risk = 3.5 * atr
+                if min_risk <= risk <= max_risk:
+                    tp_raw = entry - (3.0 * risk)
+                    signal = {
+                        "pair": symbol,
+                        "timeframe": tf,
+                        "direction": "SELL",
+                        "market_structure": f"{session_name} · {tf.upper()} BSL Sweep + OB Retest (1:3)",
+                        "liquidity_zone": format_price(symbol, sweep_high_bear),
+                        "entry_price": format_price(symbol, entry),
+                        "stop_loss": format_price(symbol, sl_raw),
+                        "take_profit_liquidity": format_price(symbol, tp_raw),
+                        "trailing_atr_exit": format_price(symbol, entry - risk),
+                        "candle_pattern": "BSL Sweep -> OB Retest",
+                        "status": "ACTIVE",
+                    }
+
+    # --- Bullish Setup: SSL swept -> bullish shift -> pullback into bullish Order Block ---
+    if signal is None:
+        search_start_bull = max(ssl_idx + 1, n - 12)
+        sweep_low_bull: Optional[float] = None
+        sweep_pos_bull: Optional[int] = None
+        for k in range(search_start_bull, n - 1):
+            c_k = work_df.iloc[k]
+            if float(c_k["low"]) < ssl and float(c_k["close"]) > ssl:
+                sweep_low_bull = float(c_k["low"])
+                sweep_pos_bull = k
+                break
+
+        if sweep_low_bull is not None and sweep_pos_bull is not None:
+            ob_top_b: Optional[float] = None
+            ob_bot_b: Optional[float] = None
+            for b_idx in range(sweep_pos_bull, max(0, sweep_pos_bull - 6), -1):
+                b_c = work_df.iloc[b_idx]
+                if float(b_c["close"]) < float(b_c["open"]):
+                    ob_top_b = float(b_c["high"])
+                    ob_bot_b = float(b_c["low"])
+                    break
+
+            after_sweep_bull = work_df.iloc[sweep_pos_bull + 1 : n - 1]
+            bullish_shift = (
+                len(after_sweep_bull) >= 1
+                and float(after_sweep_bull["close"].max()) > float(work_df.iloc[sweep_pos_bull]["high"])
+                and float(after_sweep_bull["low"].min()) >= sweep_low_bull
+            )
+
+            if ob_top_b is not None and ob_bot_b is not None and bullish_shift:
+                retest_ob_bull = (
+                    (low_price <= ob_top_b)
+                    and (high_price >= ob_bot_b)
+                    and (low_price >= sweep_low_bull)
+                    and (close_price > open_price)
+                    and (close_price >= ob_bot_b)
+                )
+                if session_allowed and retest_ob_bull:
+                    entry = close_price
+                    sl_raw = sweep_low_bull - sl_pad
+                    risk = entry - sl_raw
+                    min_risk = 2.0 * pip_size
+                    max_risk = 3.5 * atr
+                    if min_risk <= risk <= max_risk:
+                        tp_raw = entry + (3.0 * risk)
+                        signal = {
+                            "pair": symbol,
+                            "timeframe": tf,
+                            "direction": "BUY",
+                            "market_structure": f"{session_name} · {tf.upper()} SSL Sweep + OB Retest (1:3)",
+                            "liquidity_zone": format_price(symbol, sweep_low_bull),
+                            "entry_price": format_price(symbol, entry),
+                            "stop_loss": format_price(symbol, sl_raw),
+                            "take_profit_liquidity": format_price(symbol, tp_raw),
+                            "trailing_atr_exit": format_price(symbol, entry + risk),
+                            "candle_pattern": "SSL Sweep -> OB Retest",
+                            "status": "ACTIVE",
+                        }
 
     recent_window = work_df.iloc[-12:]
     swing_origin = float(recent_window.iloc[0]["open"])
@@ -342,49 +425,6 @@ def analyze_maee_liquidity(
     maee_ratio = round(mfe_move / mae_move, 2)
     mfe_pips = round(mfe_move * pip_mult, 1)
     mae_pips = round(mae_move * pip_mult, 1)
-
-    signal: Optional[Dict[str, Any]] = None
-    sl_buffer = 0.75 * atr
-
-    if session_allowed and confirmed_bsl_continuation:
-        entry = close_price
-        sl_raw = min(low_price, bsl) - sl_buffer
-        risk = entry - sl_raw
-        if (0.75 * atr) <= risk <= (2.5 * atr):
-            tp_raw = entry + (3.0 * risk)
-            signal = {
-                "pair": symbol,
-                "timeframe": tf,
-                "direction": "BUY",
-                "market_structure": f"{session_name} · Confirmed BSL Sweep (1:3)",
-                "liquidity_zone": format_price(symbol, bsl),
-                "entry_price": format_price(symbol, entry),
-                "stop_loss": format_price(symbol, sl_raw),
-                "take_profit_liquidity": format_price(symbol, tp_raw),
-                "trailing_atr_exit": format_price(symbol, entry + risk),
-                "candle_pattern": "Confirmed Major BSL Sweep",
-                "status": "ACTIVE",
-            }
-
-    elif session_allowed and confirmed_ssl_continuation:
-        entry = close_price
-        sl_raw = max(high_price, ssl) + sl_buffer
-        risk = sl_raw - entry
-        if (0.75 * atr) <= risk <= (2.5 * atr):
-            tp_raw = entry - (3.0 * risk)
-            signal = {
-                "pair": symbol,
-                "timeframe": tf,
-                "direction": "SELL",
-                "market_structure": f"{session_name} · Confirmed SSL Sweep (1:3)",
-                "liquidity_zone": format_price(symbol, ssl),
-                "entry_price": format_price(symbol, entry),
-                "stop_loss": format_price(symbol, sl_raw),
-                "take_profit_liquidity": format_price(symbol, tp_raw),
-                "trailing_atr_exit": format_price(symbol, entry - risk),
-                "candle_pattern": "Confirmed Major SSL Sweep",
-                "status": "ACTIVE",
-            }
 
     levels = {
         "bsl": format_price(symbol, bsl),
